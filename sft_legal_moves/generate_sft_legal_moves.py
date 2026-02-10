@@ -41,7 +41,11 @@ def load_templates(template_dir: str) -> Dict[str, str]:
 # ── Move description helpers ─────────────────────────────────────────────────
 
 def describe_legal_move(board: chess.Board, uci: str, templates: Dict[str, str]) -> str:
-    """Generate brief description of a legal move."""
+    """Generate brief description of a legal move.
+
+    In check positions, uses check-specific templates (king escape, capture
+    checker, block check) instead of the generic legal_move template.
+    """
     move = chess.Move.from_uci(uci)
     piece = board.piece_at(move.from_square)
     san = move_to_san(board, uci)
@@ -50,6 +54,30 @@ def describe_legal_move(board: chess.Board, uci: str, templates: Dict[str, str])
         return templates["legal_move"].format(move=san, piece_name="piece", move_desc="")
 
     name = PIECE_NAME[piece.piece_type]
+    dest_square = chess.square_name(move.to_square)
+
+    # ── Check-specific descriptions ──
+    if board.is_check():
+        checkers = list(board.checkers())
+        checker_desc = " and ".join(piece_desc(board, sq) for sq in checkers)
+
+        # King move → escape
+        if piece.piece_type == chess.KING:
+            return templates["legal_king_escape"].format(
+                move=san, dest_square=dest_square,
+            )
+        # Non-king capture of the checking piece → capture checker
+        if move.to_square in checkers:
+            return templates["legal_capture_checker"].format(
+                move=san, checker_desc=checker_desc, piece_name=name,
+            )
+        # Otherwise → block (interposition)
+        return templates["legal_block_check"].format(
+            move=san, checker_desc=checker_desc,
+            piece_name=name, dest_square=dest_square,
+        )
+
+    # ── Normal (non-check) descriptions ──
     descs = []
 
     target = board.piece_at(move.to_square)
@@ -307,6 +335,7 @@ def main():
 
     required = [
         "reasoning_template", "legal_move",
+        "legal_king_escape", "legal_capture_checker", "legal_block_check",
         "king_to_attacked", "castling_through_attacked", "castling_in_check",
         "pin_breaking", "non_king_double_check",
         "ep_fake_diagonal", "ep_wrong_pawn",

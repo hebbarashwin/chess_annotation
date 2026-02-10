@@ -70,9 +70,13 @@ sft_legal_moves/
 ├── extract_positions.py          # CLI: PGN → intermediate JSONL
 ├── generate_sft_legal_moves.py   # CLI: intermediate JSONL → SFT traces
 ├── extract_eval_positions.ipynb  # Interactive notebook for exploration/debugging
-├── reasoning_templates/          # One .txt template per illegal move type
+├── visualize_reasoning.ipynb    # Visualize boards + template-filled reasoning traces
+├── reasoning_templates/          # One .txt template per move type
 │   ├── reasoning_template.txt    #   Wrapper: <think>...<answer> structure
-│   ├── legal_move.txt            #   Legal move description
+│   ├── legal_move.txt            #   Legal move (non-check)
+│   ├── legal_king_escape.txt     #   King escapes check
+│   ├── legal_capture_checker.txt #   Piece captures the checking piece
+│   ├── legal_block_check.txt     #   Piece blocks the check ray
 │   ├── king_to_attacked.txt      #   King moves to attacked square
 │   ├── castling_through_attacked.txt
 │   ├── castling_in_check.txt
@@ -123,7 +127,7 @@ sft_legal_moves/
 | `fen` | str | Board position for reference |
 | `tags` | list[str] | Position categories for filtering |
 
-**Example output:**
+**Example output** (check position -- legal moves explain how they resolve the check):
 ```
 <think>
 The current position is: r3k2r/pp2b1pp/2p1N1b1/q7/8/3P1Q2/PPP2PPP/R3K2R w KQkq - 1 15.
@@ -131,9 +135,10 @@ The previous move was d8a5. It is White's turn.
 
 I need to determine which of these candidate moves are legal: Kd1, Kf1, c3, O-O-O, Kd2, O-O
 
-Consider the move Kd1. This is a legal king move.
-Consider the move Kf1. This is a legal king move.
-Consider the move c3. This is a legal pawn move.
+Consider the move Kd1. The king is in check. This king move to d1 escapes the check. This is legal.
+Consider the move Kf1. The king is in check. This king move to f1 escapes the check. This is legal.
+Consider the move c3. The king is in check from the black queen on a5. The pawn moves to c3,
+  blocking the line of attack. This is legal.
 Consider the move O-O-O. This is castling, but the king is currently in check.
   I cannot castle while in check, so this is illegal.
 Consider the move Kd2. This moves the king to d2, which is controlled by
@@ -158,6 +163,19 @@ Per position, the candidate set contains:
 Candidates are shuffled before presentation.
 
 ## Position Categories
+
+### Legal move reasoning
+
+In check positions, legal moves get check-specific explanations:
+
+| Template | When used |
+|---|---|
+| `legal_king_escape` | King move that escapes check |
+| `legal_capture_checker` | Non-king piece captures the checking piece |
+| `legal_block_check` | Non-king piece interposes on the check ray |
+| `legal_move` | All legal moves in non-check positions |
+
+In non-check positions, `legal_move` annotates captures, castling, en passant, promotions, and delivered checks.
 
 ### Category-specific illegal move types
 
@@ -209,13 +227,16 @@ python generate_sft_legal_moves.py \
     --seed N              # Random seed (default: 42)
 ```
 
-### Interactive notebook
+### Notebooks
 
 ```bash
-jupyter notebook extract_eval_positions.ipynb
+jupyter notebook extract_eval_positions.ipynb   # Extraction + sanity checks
+jupyter notebook visualize_reasoning.ipynb      # Visualize reasoning templates
 ```
 
-The notebook imports from `legal_moves.py` and `legal_move_puzzles.py`, runs extraction, and provides interactive visualization and browsing (`browse(rows, tag_filter='pin')`).
+`extract_eval_positions.ipynb` imports from `legal_moves.py` and `legal_move_puzzles.py`, runs extraction, and provides interactive visualization and browsing (`browse(rows, tag_filter='pin')`).
+
+`visualize_reasoning.ipynb` loads extracted positions, samples candidates, fills reasoning templates, and displays board SVGs with color-coded arrows alongside the per-move template text and full reasoning trace. Use `browse(tag_filter='check')` to step through positions by category.
 
 ## Data Source
 

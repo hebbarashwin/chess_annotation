@@ -1,126 +1,231 @@
-# SFT Legal Moves -- Next-Move Prediction Dataset
+# SFT Legal Moves
 
-Extract chess positions from game databases for **next-move prediction** evaluation. Each record presents a position with a mix of legal and illegal candidate moves; the task is to identify which moves are legal.
+Train and evaluate models on **legal-move identification** in chess. Given a position and a small set of candidate moves (mix of legal and illegal), the model must identify which are legal, with type-specific reasoning.
 
-## Data Source
-
-Positions are extracted from the [Lichess Open Database](https://database.lichess.org/).
-
-We use the January 2013 standard rated games:
-1. Download: https://database.lichess.org/standard/lichess_db_standard_rated_2013-01.pgn.zst
-2. Decompress `.zst` → `.pgn` (e.g. `zstd -d lichess_db_standard_rated_2013-01.pgn.zst`)
-3. Place the `.pgn` file in `data/`
-
-## Output Format
-
-Each record is a JSON line (`.jsonl`) with these fields:
-
-| Field | Description |
-|---|---|
-| `fen` | Board position (FEN string) |
-| `last_move_uci` | The move that led to this position |
-| `game_move_uci` | The move actually played in the game |
-| `next_move_candidates_uci` | All candidate moves (legal + illegal) |
-| `correct_outputs_uci` | All legal moves (= correct answers) |
-| `illegal_category_uci` | Category-specific illegal moves (see below) |
-| `illegal_general_uci` | General distractor illegal moves (see below) |
-| `tags` | Which categories this position belongs to |
-| `phase` | Game phase: `opening`, `middlegame`, or `endgame` |
-| `game_id` | Lichess game URL |
-| `ply` | Half-move number in the game |
-
-`next_move_candidates_uci` = `correct_outputs_uci` ∪ `illegal_category_uci` ∪ `illegal_general_uci`
-
-## Position Categories
-
-### 1. En Passant (`en_passant`)
-Positions where en passant capture is legal. Tests whether the model knows this special pawn rule.
-
-**Category illegals:** Pawn diagonal moves to empty squares that aren't the en passant square (looks like a capture but nothing is there).
-
-### 2. Single Check Evasion (`check`)
-In check by one piece, with at least 2 types of evasion available (king move, capture attacker, block). Tests understanding of check response options.
-
-**Category illegals:** King moves to squares still attacked by opponent + castling while in check.
-
-### 3. Double Check (`double_check`)
-Two pieces give check simultaneously. Only king moves are legal -- you can't capture or block both checkers at once.
-
-**Category illegals:** Non-king pseudo-legal moves that capture/block one checker (tempting but illegal since the other checker still gives check) + king moves to attacked squares + castling while in check.
-
-### 4. Illegal King Moves (`illegal_king`)
-Not in check, but the king has adjacent squares or castling paths controlled by the opponent.
-
-**Category illegals:** King moves to attacked squares + castling through/onto attacked squares (path is clear and rights exist, but a transit or destination square is attacked).
-
-### 5. Pin (`pin`)
-The side to move has one of its own pieces pinned to its own king by an opponent sliding piece. Moving the pinned piece off the pin ray would expose the king.
-
-**Category illegals:** Pseudo-legal moves of the pinned piece that leave the pin ray.
-
-### 6. Promotion (`promotion`)
-A pawn is on the 7th rank (or 2nd for black) and can promote.
-
-**Category illegals:** Promotion push onto an occupied square (pawn blocked) + promotion capture to an empty square (nothing to capture diagonally).
-
-### 7. Vanilla (`vanilla`)
-Random positions with no special tag. Only general distractors, no category-specific illegals. Controlled by `NUM_VANILLA_POSITIONS` config knob.
-
-## General Distractors
-
-Added to every position (tagged and vanilla) to pad candidates with plausible-looking but fundamentally illegal moves. Controlled by `NUM_GENERAL_DISTRACTORS` config knob.
-
-| Type | Description |
-|---|---|
-| `backward_pawn` | Pawn moves in the wrong direction |
-| `friendly_fire` | Piece "captures" its own piece |
-| `blocked_sliding` | Rook/bishop/queen moves through a blocking piece |
-| `pawn_double_wrong_rank` | Pawn double-pushes from a non-starting rank |
-| `pawn_push_onto_piece` | Pawn pushes forward into an occupied square |
-| `wrong_geometry` | Piece moves in a way its type doesn't allow (knight diagonal, bishop straight, rook diagonal) |
-
-Sampling is diversity-aware: one from each available type first, then fill randomly.
-
-## Config Knobs
-
-All at the top of the notebook:
-
-| Variable | Default | Description |
-|---|---|---|
-| `PGN_PATH` | `data/lichess_db_standard_rated_2013-01.pgn` | Path to input PGN |
-| `MAX_GAMES` | `50` | Number of games to scan |
-| `NUM_GENERAL_DISTRACTORS` | `5` | General illegal moves per position |
-| `NUM_VANILLA_POSITIONS` | `100` | Vanilla positions to sample |
-| `SEED` | `50` | RNG seed for reproducibility |
-
-## Usage
+## Quick Start
 
 ```bash
-# activate environment with python-chess installed
-conda activate dev  # or: pip install python-chess
+source activate dev  # or: pip install python-chess
 
-# run the notebook
-jupyter notebook extract_eval_positions.ipynb
+# Step 1: Extract positions from PGN → intermediate JSONL
+python extract_positions.py \
+    --pgn_path data/lichess_db_standard_rated_2013-02.pgn \
+    --out_path data/train_positions.jsonl \
+    --max_games 1400 --seed 42
+
+# Step 2: Generate SFT reasoning traces
+python generate_sft_legal_moves.py \
+    --data_path data/train_positions.jsonl \
+    --template_dir reasoning_templates/ \
+    --out_path data/sft_legal_moves_train.jsonl \
+    --seed 42
 ```
 
-Run all cells top-to-bottom. The notebook includes:
-- Position extraction with per-category detection
-- Summary statistics and tag co-occurrence
-- SVG board visualization (yellow=last move, red=category illegals, orange=general illegals)
-- Sanity checks (verifies legality/illegality of all moves)
-- Interactive browser (`browse(rows)` or `browse(rows, tag_filter='pin')`)
-- JSONL export to `data/eval_positions_preview.jsonl`
+## Data Splits
 
-## Dependencies
+| Split | PGN source | Positions | SFT traces | Seed |
+|---|---|---|---|---|
+| **Train** | `lichess_db_standard_rated_2013-02.pgn` | 31,143 | 31,143 | 42 |
+| **Eval** | `lichess_db_standard_rated_2013-01.pgn` | 29,016 | 29,016 | 99 |
 
-- `python-chess` (tested with v1.9.4)
-- `jupyter` / `ipython`
+Both extracted with `--max_games 1400 --num_vanilla 2000 --num_distractors 5`.
+
+### Tag distribution (train / eval)
+
+| Tag | Train | Eval |
+|---|---|---|
+| `illegal_king` | 22,317 | 20,380 |
+| `pin` | 4,361 | 4,199 |
+| `check` | 3,254 | 3,134 |
+| `vanilla` | 2,000 | 2,000 |
+| `promotion` | 528 | 489 |
+| `en_passant` | 168 | 120 |
+| `double_check` | 20 | 21 |
+
+## Pipeline
+
+```
+PGN file
+  │
+  ▼
+extract_positions.py          →  train_positions.jsonl / eval_positions.jsonl
+  (detect categories,             (intermediate: FEN + typed illegal moves)
+   build illegal distractors)
+  │
+  ▼
+generate_sft_legal_moves.py   →  sft_legal_moves_train.jsonl / sft_legal_moves_eval.jsonl
+  (sample candidates,              (final: input prompt + reasoning trace)
+   fill reasoning templates)
+```
 
 ## File Structure
 
 ```
 sft_legal_moves/
-├── README.md
-├── extract_eval_positions.ipynb   # main notebook
-└── data/                          # put PGN here; JSONL output goes here
+├── legal_moves.py                # Shared helpers: piece descriptions, SAN conversion,
+│                                 #   attacker/pinner/blocker detection, castling geometry,
+│                                 #   phase classification, PGN iterator
+├── legal_move_puzzles.py         # Position detectors (detect_*), illegal-move builders
+│                                 #   (build_*), general distractors, extract_all()
+├── extract_positions.py          # CLI: PGN → intermediate JSONL
+├── generate_sft_legal_moves.py   # CLI: intermediate JSONL → SFT traces
+├── extract_eval_positions.ipynb  # Interactive notebook for exploration/debugging
+├── reasoning_templates/          # One .txt template per illegal move type
+│   ├── reasoning_template.txt    #   Wrapper: <think>...<answer> structure
+│   ├── legal_move.txt            #   Legal move description
+│   ├── king_to_attacked.txt      #   King moves to attacked square
+│   ├── castling_through_attacked.txt
+│   ├── castling_in_check.txt
+│   ├── pin_breaking.txt
+│   ├── non_king_double_check.txt
+│   ├── ep_fake_diagonal.txt      #   Pawn diagonal to empty (no adjacent enemy pawn)
+│   ├── ep_wrong_pawn.txt         #   Adjacent enemy pawn didn't just double-push
+│   ├── promo_push_blocked.txt
+│   ├── promo_capture_empty.txt
+│   ├── backward_pawn.txt
+│   ├── friendly_fire.txt
+│   ├── blocked_sliding.txt
+│   ├── pawn_double_wrong_rank.txt
+│   ├── pawn_push_onto_piece.txt
+│   └── wrong_geometry.txt
+├── data/
+│   ├── lichess_db_standard_rated_2013-01.pgn  # Eval source
+│   ├── lichess_db_standard_rated_2013-02.pgn  # Train source
+│   ├── train_positions.jsonl       # Intermediate: extracted positions (train)
+│   ├── eval_positions.jsonl        # Intermediate: extracted positions (eval)
+│   ├── sft_legal_moves_train.jsonl # Final SFT data (train)
+│   └── sft_legal_moves_eval.jsonl  # Final SFT data (eval)
+└── README.md
 ```
+
+## Output Formats
+
+### Intermediate JSONL (extract_positions.py)
+
+| Field | Type | Description |
+|---|---|---|
+| `fen` | str | Board position (FEN) |
+| `last_move_uci` | str | Move that led to this position |
+| `game_move_uci` | str | Move actually played in the game |
+| `next_move_candidates_uci` | list[str] | All candidate moves (legal + illegal) |
+| `correct_outputs_uci` | list[str] | All legal moves |
+| `illegal_category` | list[dict] | Category-specific illegals: `{"uci", "type"}` |
+| `illegal_general` | list[dict] | General distractors: `{"uci", "type"}` |
+| `tags` | list[str] | Position categories |
+| `phase` | str | `opening` / `middlegame` / `endgame` |
+
+### SFT JSONL (generate_sft_legal_moves.py)
+
+| Field | Type | Description |
+|---|---|---|
+| `input` | str | Prompt: FEN + previous move + candidate list (SAN) |
+| `output` | str | `<think>` per-move analysis `</think><answer>\boxed{legal moves}</answer>` |
+| `fen` | str | Board position for reference |
+| `tags` | list[str] | Position categories for filtering |
+
+**Example output:**
+```
+<think>
+The current position is: r3k2r/pp2b1pp/2p1N1b1/q7/8/3P1Q2/PPP2PPP/R3K2R w KQkq - 1 15.
+The previous move was d8a5. It is White's turn.
+
+I need to determine which of these candidate moves are legal: Kd1, Kf1, c3, O-O-O, Kd2, O-O
+
+Consider the move Kd1. This is a legal king move.
+Consider the move Kf1. This is a legal king move.
+Consider the move c3. This is a legal pawn move.
+Consider the move O-O-O. This is castling, but the king is currently in check.
+  I cannot castle while in check, so this is illegal.
+Consider the move Kd2. This moves the king to d2, which is controlled by
+  the black queen on a5. Moving the king to an attacked square is illegal.
+Consider the move O-O. This is castling, but the king is currently in check.
+  I cannot castle while in check, so this is illegal.
+
+From the candidates, the legal moves are: Kd1, Kf1, c3
+</think>
+<answer>
+\boxed{Kd1, Kf1, c3}
+</answer>
+```
+
+### Sampling strategy (generate_sft_legal_moves.py)
+
+Per position, the candidate set contains:
+1. **All category illegals** (the point of the exercise)
+2. **`--num_illegal_gen` general illegals** (default 2, randomly sampled)
+3. **`--num_legal` legal moves** (default 3, always includes the game move)
+
+Candidates are shuffled before presentation.
+
+## Position Categories
+
+### Category-specific illegal move types
+
+| Category | Illegal types | Description |
+|---|---|---|
+| `en_passant` | `ep_fake_diagonal`, `ep_wrong_pawn` | Diagonal to empty (no ep target) or adjacent pawn didn't just push |
+| `check` | `king_to_attacked`, `castling_in_check` | King to attacked square, castling while in check |
+| `double_check` | `king_to_attacked`, `non_king_double_check`, `castling_in_check` | + non-king moves that only address one checker |
+| `illegal_king` | `king_to_attacked`, `castling_through_attacked` | King to attacked square, castling through attacked |
+| `pin` | `pin_breaking` | Pinned piece moves off the pin ray |
+| `promotion` | `promo_push_blocked`, `promo_capture_empty` | Push onto occupied square, diagonal capture to empty |
+
+### General distractor types (added to all positions)
+
+| Type | Description |
+|---|---|
+| `backward_pawn` | Pawn moves in wrong direction |
+| `friendly_fire` | Piece "captures" own piece |
+| `blocked_sliding` | Sliding piece moves through a blocker |
+| `pawn_double_wrong_rank` | Double-push from non-starting rank |
+| `pawn_push_onto_piece` | Pawn pushes forward into occupied square |
+| `wrong_geometry_knight` | Knight moves diagonally (like a bishop) |
+| `wrong_geometry_bishop` | Bishop moves straight (like a rook) |
+| `wrong_geometry_rook` | Rook moves diagonally (like a bishop) |
+
+## CLI Reference
+
+### extract_positions.py
+
+```
+python extract_positions.py \
+    --pgn_path PATH       # Input PGN file
+    --out_path PATH       # Output JSONL
+    --max_games N         # Games to scan (default: 1400)
+    --num_distractors N   # General distractors per position (default: 5)
+    --num_vanilla N       # Vanilla positions to sample (default: 2000)
+    --seed N              # Random seed (default: 42)
+```
+
+### generate_sft_legal_moves.py
+
+```
+python generate_sft_legal_moves.py \
+    --data_path PATH      # Input JSONL from extract_positions.py
+    --template_dir PATH   # Directory with reasoning template .txt files
+    --out_path PATH       # Output SFT JSONL
+    --num_legal N         # Legal moves per candidate set (default: 3)
+    --num_illegal_gen N   # General illegals per candidate set (default: 2)
+    --seed N              # Random seed (default: 42)
+```
+
+### Interactive notebook
+
+```bash
+jupyter notebook extract_eval_positions.ipynb
+```
+
+The notebook imports from `legal_moves.py` and `legal_move_puzzles.py`, runs extraction, and provides interactive visualization and browsing (`browse(rows, tag_filter='pin')`).
+
+## Data Source
+
+Positions are extracted from the [Lichess Open Database](https://database.lichess.org/) (standard rated games).
+
+1. Download from https://database.lichess.org/standard/
+2. Decompress `.zst` → `.pgn` (`zstd -d <file>.pgn.zst`)
+3. Place `.pgn` files in `data/`
+
+## Dependencies
+
+- `python-chess` (tested with v1.9.4)
+- `jupyter` / `ipython` (for the notebook only)

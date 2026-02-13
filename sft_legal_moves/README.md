@@ -91,6 +91,8 @@ sft_legal_moves/
 │   ├── blocked_sliding.txt
 │   ├── pawn_double_wrong_rank.txt
 │   ├── pawn_push_onto_piece.txt
+│   ├── pawn_diagonal_to_empty.txt  #   Pawn diagonal to empty (no capture, non-EP)
+│   ├── pawn_capture_friendly.txt   #   Pawn captures own piece diagonally
 │   └── wrong_geometry.txt
 ├── data/
 │   ├── lichess_db_standard_rated_2013-01.pgn  # Eval source
@@ -197,6 +199,8 @@ In non-check positions, `legal_move` annotates captures, castling, en passant, p
 | `blocked_sliding` | Sliding piece moves through a blocker |
 | `pawn_double_wrong_rank` | Double-push from non-starting rank |
 | `pawn_push_onto_piece` | Pawn pushes forward into occupied square |
+| `pawn_diagonal_to_empty` | Pawn moves diagonally to empty square (no capture) |
+| `pawn_capture_friendly` | Pawn captures own piece diagonally |
 | `wrong_geometry_knight` | Knight moves diagonally (like a bishop) |
 | `wrong_geometry_bishop` | Bishop moves straight (like a rook) |
 | `wrong_geometry_rook` | Rook moves diagonally (like a bishop) |

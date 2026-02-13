@@ -196,6 +196,16 @@ def describe_illegal_move(
             move=san, dest_square=dest_square, blocking_piece=blocking_piece,
         )
 
+    elif move_type == "pawn_diagonal_to_empty":
+        return templates["pawn_diagonal_to_empty"].format(move=san, dest_square=dest_square)
+
+    elif move_type == "pawn_capture_friendly":
+        target = board.piece_at(move.to_square)
+        target_piece = PIECE_NAME.get(target.piece_type, "piece") if target else "piece"
+        return templates["pawn_capture_friendly"].format(
+            move=san, target_piece=target_piece, dest_square=dest_square,
+        )
+
     elif move_type.startswith("wrong_geometry"):
         reason = GEOMETRY_REASONS.get(move_type, "this geometry is not valid for this piece")
         return templates["wrong_geometry"].format(
@@ -341,7 +351,9 @@ def main():
         "ep_fake_diagonal", "ep_wrong_pawn",
         "promo_push_blocked", "promo_capture_empty",
         "backward_pawn", "friendly_fire", "blocked_sliding",
-        "pawn_double_wrong_rank", "pawn_push_onto_piece", "wrong_geometry",
+        "pawn_double_wrong_rank", "pawn_push_onto_piece",
+        "pawn_diagonal_to_empty", "pawn_capture_friendly",
+        "wrong_geometry",
     ]
     missing = [t for t in required if t not in templates]
     if missing:

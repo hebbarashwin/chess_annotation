@@ -443,6 +443,49 @@ def _gen_pawn_double_push_wrong_rank(board: chess.Board, turn: chess.Color) -> L
     return results
 
 
+def _gen_pawn_diagonal_to_empty(board: chess.Board, turn: chess.Color) -> List[Tuple[chess.Move, str]]:
+    """Pawn moves diagonally to an empty square (no capture, not en passant)."""
+    results = []
+    direction = 1 if turn == chess.WHITE else -1
+    promo_rank = 7 if turn == chess.WHITE else 0
+    for sq in board.pieces(chess.PAWN, turn):
+        rank, file = chess.square_rank(sq), chess.square_file(sq)
+        dest_rank = rank + direction
+        if not (0 <= dest_rank <= 7):
+            continue
+        # Skip promotion rank (handled by promo_capture_empty)
+        if dest_rank == promo_rank:
+            continue
+        for df in [-1, 1]:
+            dest_file = file + df
+            if not (0 <= dest_file <= 7):
+                continue
+            dest = chess.square(dest_file, dest_rank)
+            if board.piece_at(dest) is None and dest != board.ep_square:
+                results.append((chess.Move(sq, dest), "pawn_diagonal_to_empty"))
+    return results
+
+
+def _gen_pawn_capture_friendly(board: chess.Board, turn: chess.Color) -> List[Tuple[chess.Move, str]]:
+    """Pawn captures own piece diagonally."""
+    results = []
+    direction = 1 if turn == chess.WHITE else -1
+    for sq in board.pieces(chess.PAWN, turn):
+        rank, file = chess.square_rank(sq), chess.square_file(sq)
+        dest_rank = rank + direction
+        if not (0 <= dest_rank <= 7):
+            continue
+        for df in [-1, 1]:
+            dest_file = file + df
+            if not (0 <= dest_file <= 7):
+                continue
+            dest = chess.square(dest_file, dest_rank)
+            target = board.piece_at(dest)
+            if target and target.color == turn:
+                results.append((chess.Move(sq, dest), "pawn_capture_friendly"))
+    return results
+
+
 def _gen_pawn_push_onto_piece(board: chess.Board, turn: chess.Color) -> List[Tuple[chess.Move, str]]:
     results = []
     direction = 8 if turn == chess.WHITE else -8
@@ -505,6 +548,8 @@ def generate_general_distractors(
     all_candidates += _gen_blocked_sliding(board, turn)
     all_candidates += _gen_pawn_double_push_wrong_rank(board, turn)
     all_candidates += _gen_pawn_push_onto_piece(board, turn)
+    all_candidates += _gen_pawn_diagonal_to_empty(board, turn)
+    all_candidates += _gen_pawn_capture_friendly(board, turn)
     all_candidates += _gen_wrong_geometry(board, turn)
 
     seen = set(legal_ucis)

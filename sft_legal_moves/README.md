@@ -56,6 +56,11 @@ extract_positions.py          →  train_positions.jsonl / eval_positions.jsonl
 generate_sft_legal_moves.py   →  sft_legal_moves_train.jsonl / sft_legal_moves_eval.jsonl
   (sample candidates,              (final: input prompt + reasoning trace)
    fill reasoning templates)
+  │
+  ▼
+generate_eval_binary.py       →  eval_binary.jsonl
+  (flatten to per-move rows,       (binary classification: fen + move + label)
+   balanced sampling)
 ```
 
 ## File Structure
@@ -66,9 +71,11 @@ sft_legal_moves/
 │                                 #   attacker/pinner/blocker detection, castling geometry,
 │                                 #   phase classification, PGN iterator
 ├── legal_move_puzzles.py         # Position detectors (detect_*), illegal-move builders
-│                                 #   (build_*), general distractors, extract_all()
+│                                 #   (build_*), general distractors, extract_all(),
+│                                 #   classify_legal_move(), SUBCATEGORY_TO_CATEGORY
 ├── extract_positions.py          # CLI: PGN → intermediate JSONL
 ├── generate_sft_legal_moves.py   # CLI: intermediate JSONL → SFT traces
+├── generate_eval_binary.py       # CLI: intermediate JSONL → binary eval JSONL
 ├── extract_eval_positions.ipynb  # Interactive notebook for exploration/debugging
 ├── visualize_reasoning.ipynb    # Visualize boards + template-filled reasoning traces
 ├── reasoning_templates/          # One .txt template per move type
@@ -129,6 +136,19 @@ sft_legal_moves/
 | `fen` | str | Board position for reference |
 | `tags` | list[str] | Position categories for filtering |
 
+### Binary Eval JSONL (generate_eval_binary.py)
+
+| Field | Type | Description |
+|---|---|---|
+| `fen` | str | Board position (FEN) |
+| `move_uci` | str | Move in UCI notation |
+| `move_san` | str | Move in SAN notation |
+| `label` | str | `legal` or `illegal` |
+| `category` | str | Parent category (e.g. `king`, `pawn`, `legal`) |
+| `subcategory` | str | Specific type (e.g. `king_to_attacked`, `legal_capture`) |
+| `position_tags` | list[str] | Position-level tags |
+| `phase` | str | `opening` / `middlegame` / `endgame` |
+
 **Example output** (check position -- legal moves explain how they resolve the check):
 ```
 <think>
@@ -184,7 +204,7 @@ In non-check positions, `legal_move` annotates captures, castling, en passant, p
 | Category | Illegal types | Description |
 |---|---|---|
 | `en_passant` | `ep_fake_diagonal`, `ep_wrong_pawn` | Diagonal to empty (no ep target) or adjacent pawn didn't just push |
-| `check` | `king_to_attacked`, `castling_in_check` | King to attacked square, castling while in check |
+| `check` | `king_to_attacked`, `castling_in_check`, `non_evasion_in_check` | King to attacked square, castling while in check, non-king move that doesn't address check |
 | `double_check` | `king_to_attacked`, `non_king_double_check`, `castling_in_check` | + non-king moves that only address one checker |
 | `illegal_king` | `king_to_attacked`, `castling_through_attacked` | King to attacked square, castling through attacked |
 | `pin` | `pin_breaking` | Pinned piece moves off the pin ray |
@@ -198,12 +218,31 @@ In non-check positions, `legal_move` annotates captures, castling, en passant, p
 | `friendly_fire` | Piece "captures" own piece |
 | `blocked_sliding` | Sliding piece moves through a blocker |
 | `pawn_double_wrong_rank` | Double-push from non-starting rank |
+| `pawn_double_push_blocked` | Double-push from starting rank with blocked intermediate square |
 | `pawn_push_onto_piece` | Pawn pushes forward into occupied square |
 | `pawn_diagonal_to_empty` | Pawn moves diagonally to empty square (no capture) |
 | `pawn_capture_friendly` | Pawn captures own piece diagonally |
+| `wrong_ep` | Pawn on EP rank tries diagonal behind adjacent enemy pawn, but EP not available |
+| `castling_path_occupied` | Castling when pieces sit between king and rook |
 | `wrong_geometry_knight` | Knight moves diagonally (like a bishop) |
 | `wrong_geometry_bishop` | Bishop moves straight (like a rook) |
 | `wrong_geometry_rook` | Rook moves diagonally (like a bishop) |
+| `wrong_geometry_queen` | Queen moves in L-shape (like a knight) |
+| `wrong_geometry_king` | King moves more than one square (non-castling) |
+
+### Legal move subcategories (binary eval only)
+
+| Subcategory | When used |
+|---|---|
+| `legal_move` | Normal piece move (non-check, non-special) |
+| `legal_capture` | Captures an enemy piece |
+| `legal_castling` | Legal castling |
+| `legal_en_passant` | Legal en passant |
+| `legal_promotion` | Pawn promotes |
+| `legal_check` | Delivers check |
+| `legal_king_escape` | King moves out of check |
+| `legal_capture_checker` | Non-king captures the checking piece |
+| `legal_block_check` | Non-king interposes on the check ray |
 
 ## CLI Reference
 
@@ -229,6 +268,26 @@ python generate_sft_legal_moves.py \
     --num_legal N         # Legal moves per candidate set (default: 3)
     --num_illegal_gen N   # General illegals per candidate set (default: 2)
     --seed N              # Random seed (default: 42)
+```
+
+### generate_eval_binary.py
+
+```
+python generate_eval_binary.py \
+    --data_path PATH      # Input JSONL from extract_positions.py
+    --out_path PATH       # Output binary eval JSONL
+    --default_ratio F     # Legal:illegal ratio per position (default: 1.0)
+    --category_config P   # Optional JSON for per-tag overrides
+    --seed N              # Random seed (default: 42)
+```
+
+Category config example:
+```json
+{
+    "pin": {"num_positions": 500, "ratio": 2.0},
+    "check": {"num_positions": 300},
+    "en_passant": {"num_positions": null}
+}
 ```
 
 ### Notebooks

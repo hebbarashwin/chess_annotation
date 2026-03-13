@@ -76,6 +76,8 @@ GEOMETRY_REASONS = {
     "wrong_geometry_knight": "knights move in an L-shape (2+1), not diagonally",
     "wrong_geometry_bishop": "bishops move diagonally, not in straight lines",
     "wrong_geometry_rook": "rooks move in straight lines, not diagonally",
+    "wrong_geometry_queen": "queens move in straight lines or diagonally, not in an L-shape",
+    "wrong_geometry_king": "kings can only move one square at a time (except castling)",
 }
 
 

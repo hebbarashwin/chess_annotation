@@ -159,6 +159,12 @@ def describe_illegal_move(
             move=san, adjacent_pawn_square=chess.square_name(adj_sq),
         )
 
+    elif move_type == "wrong_ep":
+        adj_sq = chess.square(chess.square_file(move.to_square), chess.square_rank(move.from_square))
+        return templates["wrong_ep"].format(
+            move=san, adjacent_pawn_square=chess.square_name(adj_sq),
+        )
+
     elif move_type == "promo_push_blocked":
         blocker = board.piece_at(move.to_square)
         blocking_piece = piece_desc(board, move.to_square) if blocker else "a piece"
@@ -204,6 +210,38 @@ def describe_illegal_move(
         target_piece = PIECE_NAME.get(target.piece_type, "piece") if target else "piece"
         return templates["pawn_capture_friendly"].format(
             move=san, target_piece=target_piece, dest_square=dest_square,
+        )
+
+    elif move_type == "non_evasion_in_check":
+        checkers = list(board.checkers())
+        checker_desc = " and ".join(piece_desc(board, sq) for sq in checkers)
+        return templates["non_evasion_in_check"].format(
+            move=san, checker_desc=checker_desc, piece_name=piece_name,
+        )
+
+    elif move_type == "pawn_double_push_blocked":
+        mid_sq = move.from_square + (8 if board.turn == chess.WHITE else -8)
+        blocker = board.piece_at(mid_sq)
+        blocker_desc = piece_desc(board, mid_sq) if blocker else "a piece"
+        mid_square = chess.square_name(mid_sq)
+        return templates["pawn_double_push_blocked"].format(
+            move=san, blocker_desc=blocker_desc, mid_square=mid_square,
+        )
+
+    elif move_type == "castling_path_occupied":
+        from legal_moves import CASTLE_INFO
+        uci = move.uci()
+        blocker_desc = "a piece"
+        for info in CASTLE_INFO[board.turn]:
+            if chess.Move(info["king_from"], info["king_to"]).uci() == uci:
+                for sq in info["clear_sqs"]:
+                    p = board.piece_at(sq)
+                    if p is not None:
+                        blocker_desc = piece_desc(board, sq)
+                        break
+                break
+        return templates["castling_path_occupied"].format(
+            move=san, blocker_desc=blocker_desc,
         )
 
     elif move_type.startswith("wrong_geometry"):
@@ -354,6 +392,8 @@ def main():
         "pawn_double_wrong_rank", "pawn_push_onto_piece",
         "pawn_diagonal_to_empty", "pawn_capture_friendly",
         "wrong_geometry",
+        "non_evasion_in_check", "pawn_double_push_blocked",
+        "castling_path_occupied", "wrong_ep",
     ]
     missing = [t for t in required if t not in templates]
     if missing:

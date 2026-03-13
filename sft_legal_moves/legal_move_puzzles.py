@@ -16,7 +16,75 @@ from typing import Dict, List, Optional, Set, Tuple
 
 import chess
 
-from legal_moves import CASTLE_INFO, get_phase, iter_games
+from legal_moves import CASTLE_INFO, get_phase, iter_games, move_to_san
+
+# ── Subcategory → Category taxonomy ──────────────────────────────────────────
+
+SUBCATEGORY_TO_CATEGORY = {
+    # Illegal subcategories
+    "non_evasion_in_check": "check_evasion",
+    "non_king_double_check": "check_evasion",
+    "king_to_attacked": "king",
+    "castling_in_check": "king",
+    "castling_through_attacked": "king",
+    "castling_path_occupied": "king",
+    "wrong_geometry_king": "king",
+    "pin_breaking": "pin",
+    "backward_pawn": "pawn",
+    "pawn_double_wrong_rank": "pawn",
+    "pawn_double_push_blocked": "pawn",
+    "pawn_push_onto_piece": "pawn",
+    "pawn_diagonal_to_empty": "pawn",
+    "pawn_capture_friendly": "pawn",
+    "ep_fake_diagonal": "en_passant",
+    "ep_wrong_pawn": "en_passant",
+    "wrong_ep": "en_passant",
+    "promo_push_blocked": "promotion",
+    "promo_capture_empty": "promotion",
+    "friendly_fire": "piece_movement",
+    "blocked_sliding": "piece_movement",
+    "wrong_geometry_knight": "piece_movement",
+    "wrong_geometry_bishop": "piece_movement",
+    "wrong_geometry_rook": "piece_movement",
+    "wrong_geometry_queen": "piece_movement",
+    # Legal subcategories
+    "legal_move": "legal",
+    "legal_capture": "legal",
+    "legal_castling": "legal",
+    "legal_en_passant": "legal",
+    "legal_promotion": "legal",
+    "legal_check": "legal",
+    "legal_king_escape": "legal",
+    "legal_capture_checker": "legal",
+    "legal_block_check": "legal",
+}
+
+
+def classify_legal_move(board: chess.Board, move: chess.Move) -> str:
+    """Return the subcategory for a legal move."""
+    piece = board.piece_at(move.from_square)
+    if board.is_check():
+        checkers = list(board.checkers())
+        if piece and piece.piece_type == chess.KING:
+            return "legal_king_escape"
+        if move.to_square in checkers:
+            return "legal_capture_checker"
+        return "legal_block_check"
+    if board.is_en_passant(move):
+        return "legal_en_passant"
+    if board.is_castling(move):
+        return "legal_castling"
+    if move.promotion:
+        return "legal_promotion"
+    board.push(move)
+    gives_check = board.is_check()
+    board.pop()
+    if gives_check:
+        return "legal_check"
+    if board.piece_at(move.to_square) is not None:
+        return "legal_capture"
+    return "legal_move"
+
 
 # ── Category 1: En Passant ───────────────────────────────────────────────────
 
@@ -65,6 +133,7 @@ class CheckInfo:
     blocks: List[chess.Move]
     illegal_king_moves: List[chess.Move]
     illegal_castling: List[chess.Move]
+    illegal_non_evasion: List[chess.Move]
     num_checkers: int
 
     @property
@@ -132,12 +201,28 @@ def analyze_check(board: chess.Board) -> Optional[CheckInfo]:
 
     illegal_castling = _find_castling_in_check(board)
 
+    # Non-evasion: pseudo-legal non-king moves that don't address the check
+    legal_set = set(board.legal_moves)
+    evasion_targets = set(checkers) | block_squares
+    illegal_non_evasion = []
+    for m in board.pseudo_legal_moves:
+        mover = board.piece_at(m.from_square)
+        if mover is None or mover.piece_type == chess.KING:
+            continue
+        if m in legal_set:
+            continue
+        # Only include moves that fail because they don't address the check,
+        # not moves illegal for other reasons (e.g. pin_breaking already covers pins)
+        if m.to_square not in evasion_targets:
+            illegal_non_evasion.append(m)
+
     return CheckInfo(
         king_moves=king_moves,
         captures=captures,
         blocks=blocks,
         illegal_king_moves=illegal_king_moves,
         illegal_castling=illegal_castling,
+        illegal_non_evasion=illegal_non_evasion,
         num_checkers=len(checkers),
     )
 
@@ -147,6 +232,7 @@ def build_check_candidates(board: chess.Board, info: CheckInfo) -> List[Tuple[st
     return (
         [(m.uci(), "king_to_attacked") for m in info.illegal_king_moves]
         + [(m.uci(), "castling_in_check") for m in info.illegal_castling]
+        + [(m.uci(), "non_evasion_in_check") for m in info.illegal_non_evasion]
     )
 
 
@@ -443,11 +529,39 @@ def _gen_pawn_double_push_wrong_rank(board: chess.Board, turn: chess.Color) -> L
     return results
 
 
+def _gen_pawn_double_push_blocked(board: chess.Board, turn: chess.Color) -> List[Tuple[chess.Move, str]]:
+    """Double pawn push from starting rank where the intermediate square is occupied."""
+    results = []
+    direction = 16 if turn == chess.WHITE else -16
+    start_rank = 1 if turn == chess.WHITE else 6
+    for sq in board.pieces(chess.PAWN, turn):
+        if chess.square_rank(sq) != start_rank:
+            continue
+        mid = sq + (8 if turn == chess.WHITE else -8)
+        if not _on_board(mid):
+            continue
+        # Intermediate square must be blocked
+        if board.piece_at(mid) is None:
+            continue
+        dest = sq + direction
+        if _on_board(dest) and board.piece_at(dest) is None:
+            results.append((chess.Move(sq, dest), "pawn_double_push_blocked"))
+    return results
+
+
 def _gen_pawn_diagonal_to_empty(board: chess.Board, turn: chess.Color) -> List[Tuple[chess.Move, str]]:
-    """Pawn moves diagonally to an empty square (no capture, not en passant)."""
+    """Pawn moves diagonally to an empty square (no capture, not en passant).
+
+    If the pawn is on the EP rank (5th for white, 4th for black) and there's
+    an adjacent enemy pawn but NO ep_square is set, the move looks like an
+    en passant attempt in a position where EP isn't available — labelled
+    wrong_ep.  Otherwise labelled pawn_diagonal_to_empty.
+    """
+    opp = not turn
     results = []
     direction = 1 if turn == chess.WHITE else -1
     promo_rank = 7 if turn == chess.WHITE else 0
+    ep_rank = 4 if turn == chess.WHITE else 3  # rank where EP captures happen
     for sq in board.pieces(chess.PAWN, turn):
         rank, file = chess.square_rank(sq), chess.square_file(sq)
         dest_rank = rank + direction
@@ -462,6 +576,15 @@ def _gen_pawn_diagonal_to_empty(board: chess.Board, turn: chess.Color) -> List[T
                 continue
             dest = chess.square(dest_file, dest_rank)
             if board.piece_at(dest) is None and dest != board.ep_square:
+                # Plausible EP attempt: on EP rank, adjacent enemy pawn,
+                # but no ep_square set (pawn didn't just double-push)
+                if rank == ep_rank and board.ep_square is None:
+                    adj_sq = chess.square(dest_file, rank)
+                    adj_piece = board.piece_at(adj_sq)
+                    if (adj_piece and adj_piece.piece_type == chess.PAWN
+                            and adj_piece.color == opp):
+                        results.append((chess.Move(sq, dest), "wrong_ep"))
+                        continue
                 results.append((chess.Move(sq, dest), "pawn_diagonal_to_empty"))
     return results
 
@@ -498,6 +621,23 @@ def _gen_pawn_push_onto_piece(board: chess.Board, turn: chess.Color) -> List[Tup
     return results
 
 
+def _gen_castling_path_occupied(board: chess.Board, turn: chess.Color) -> List[Tuple[chess.Move, str]]:
+    """Castling when pieces sit between king and rook."""
+    results = []
+    for info in CASTLE_INFO[turn]:
+        if not getattr(board, info["rights_fn"])(turn):
+            continue
+        rook = board.piece_at(info["rook_sq"])
+        if rook is None or rook.piece_type != chess.ROOK or rook.color != turn:
+            continue
+        # Path must be blocked (at least one piece on clear_sqs)
+        if all(board.piece_at(sq) is None for sq in info["clear_sqs"]):
+            continue
+        castle_move = chess.Move(info["king_from"], info["king_to"])
+        results.append((castle_move, "castling_path_occupied"))
+    return results
+
+
 def _gen_wrong_geometry(board: chess.Board, turn: chess.Color) -> List[Tuple[chess.Move, str]]:
     results = []
     for sq, piece in board.piece_map().items():
@@ -531,6 +671,32 @@ def _gen_wrong_geometry(board: chess.Board, turn: chess.Color) -> List[Tuple[che
                     dp = board.piece_at(dest)
                     if dp is None or dp.color != turn:
                         results.append((chess.Move(sq, dest), "wrong_geometry_rook"))
+
+        elif piece.piece_type == chess.QUEEN:
+            # Queen moving in L-shape like a knight
+            for dr, df in [(2, 1), (2, -1), (-2, 1), (-2, -1),
+                           (1, 2), (1, -2), (-1, 2), (-1, -2)]:
+                nr, nf = rank + dr, file + df
+                if 0 <= nr <= 7 and 0 <= nf <= 7:
+                    dest = chess.square(nf, nr)
+                    dp = board.piece_at(dest)
+                    if dp is None or dp.color != turn:
+                        results.append((chess.Move(sq, dest), "wrong_geometry_queen"))
+
+        elif piece.piece_type == chess.KING:
+            # King moving more than one square (non-castling)
+            for dr, df in [(2, 0), (-2, 0), (0, 2), (0, -2),
+                           (2, 2), (2, -2), (-2, 2), (-2, -2)]:
+                nr, nf = rank + dr, file + df
+                if 0 <= nr <= 7 and 0 <= nf <= 7:
+                    dest = chess.square(nf, nr)
+                    m = chess.Move(sq, dest)
+                    # Exclude actual castling moves (king moves 2 squares on rank)
+                    if board.is_castling(m):
+                        continue
+                    dp = board.piece_at(dest)
+                    if dp is None or dp.color != turn:
+                        results.append((m, "wrong_geometry_king"))
     return results
 
 
@@ -547,9 +713,11 @@ def generate_general_distractors(
     all_candidates += _gen_friendly_fire(board, turn)
     all_candidates += _gen_blocked_sliding(board, turn)
     all_candidates += _gen_pawn_double_push_wrong_rank(board, turn)
+    all_candidates += _gen_pawn_double_push_blocked(board, turn)
     all_candidates += _gen_pawn_push_onto_piece(board, turn)
     all_candidates += _gen_pawn_diagonal_to_empty(board, turn)
     all_candidates += _gen_pawn_capture_friendly(board, turn)
+    all_candidates += _gen_castling_path_occupied(board, turn)
     all_candidates += _gen_wrong_geometry(board, turn)
 
     seen = set(legal_ucis)
@@ -683,6 +851,7 @@ def extract_all(
                         extra["check_blocks"] = len(check_info.blocks)
                         extra["check_illegal_king"] = len(check_info.illegal_king_moves)
                         extra["check_illegal_castling"] = len(check_info.illegal_castling)
+                        extra["check_non_evasion"] = len(check_info.illegal_non_evasion)
 
                 # ── Cat 4: Illegal king moves + castling (not in check) ──
                 if not board.is_check():

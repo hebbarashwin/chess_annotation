@@ -28,6 +28,7 @@ SUBCATEGORY_TO_CATEGORY = {
     "castling_in_check": "king",
     "castling_through_attacked": "king",
     "castling_path_occupied": "king",
+    "castling_no_rights": "king",
     "wrong_geometry_king": "king",
     "pin_breaking": "pin",
     "backward_pawn": "pawn",
@@ -39,6 +40,7 @@ SUBCATEGORY_TO_CATEGORY = {
     "ep_fake_diagonal": "en_passant",
     "ep_wrong_pawn": "en_passant",
     "wrong_ep": "en_passant",
+    "ep_pinned": "en_passant",
     "promo_push_blocked": "promotion",
     "promo_capture_empty": "promotion",
     "friendly_fire": "piece_movement",
@@ -700,6 +702,72 @@ def _gen_wrong_geometry(board: chess.Board, turn: chess.Color) -> List[Tuple[che
     return results
 
 
+def _gen_castling_no_rights(board: chess.Board, turn: chess.Color) -> List[Tuple[chess.Move, str]]:
+    """Castling when castling rights are absent (king or rook has moved)."""
+    results = []
+    king_sq = board.king(turn)
+    if king_sq is None:
+        return results
+    expected = chess.E1 if turn == chess.WHITE else chess.E8
+    if king_sq != expected:
+        return results
+    if board.is_check():
+        return results
+    opp = not turn
+
+    for info in CASTLE_INFO[turn]:
+        # Only when rights are ABSENT
+        if getattr(board, info["rights_fn"])(turn):
+            continue
+        # Rook should still be on its starting square (makes it plausible)
+        rook = board.piece_at(info["rook_sq"])
+        if rook is None or rook.piece_type != chess.ROOK or rook.color != turn:
+            continue
+        # Path must be clear (otherwise it's castling_path_occupied)
+        if not all(board.piece_at(sq) is None for sq in info["clear_sqs"]):
+            continue
+        # King must not pass through attacked squares (otherwise castling_through_attacked)
+        safe_sqs = info["safe_sqs"]
+        if any(board.is_attacked_by(opp, sq) for sq in safe_sqs[1:]):
+            continue
+        castle_move = chess.Move(info["king_from"], info["king_to"])
+        results.append((castle_move, "castling_no_rights"))
+    return results
+
+
+def _gen_ep_pinned(board: chess.Board, turn: chess.Color) -> List[Tuple[chess.Move, str]]:
+    """EP captures that are pseudo-legal but leave king in discovered check.
+
+    This is the rare case where the capturing pawn is NOT normally pinned, but
+    removing both pawns from the rank reveals a lateral attack on the king.
+    """
+    results = []
+    if board.ep_square is None:
+        return results
+
+    ep_sq = board.ep_square
+    ep_file = chess.square_file(ep_sq)
+    pawn_rank = chess.square_rank(ep_sq) + (-1 if turn == chess.WHITE else 1)
+
+    for adj_file in [ep_file - 1, ep_file + 1]:
+        if adj_file < 0 or adj_file > 7:
+            continue
+        from_sq = chess.square(adj_file, pawn_rank)
+        piece = board.piece_at(from_sq)
+        if piece is None or piece.piece_type != chess.PAWN or piece.color != turn:
+            continue
+        move = chess.Move(from_sq, ep_sq)
+        if not board.is_pseudo_legal(move):
+            continue
+        if board.is_legal(move):
+            continue
+        # Skip if pawn is normally pinned (that's pin_breaking)
+        if board.is_pinned(turn, from_sq):
+            continue
+        results.append((move, "ep_pinned"))
+    return results
+
+
 def generate_general_distractors(
     board: chess.Board,
     legal_ucis: Set[str],
@@ -718,6 +786,8 @@ def generate_general_distractors(
     all_candidates += _gen_pawn_diagonal_to_empty(board, turn)
     all_candidates += _gen_pawn_capture_friendly(board, turn)
     all_candidates += _gen_castling_path_occupied(board, turn)
+    all_candidates += _gen_castling_no_rights(board, turn)
+    all_candidates += _gen_ep_pinned(board, turn)
     all_candidates += _gen_wrong_geometry(board, turn)
 
     seen = set(legal_ucis)

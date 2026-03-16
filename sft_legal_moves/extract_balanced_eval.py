@@ -1,28 +1,29 @@
 #!/usr/bin/env python3
 """Extract a balanced binary eval dataset with a target count per subcategory.
 
-Single pass through PGN(s).  Each subcategory has its own RNG (derived from a
-master seed) and independently decides on-the-fly whether to keep a position.
-No two-phase buffering — extraction and selection happen together.
+Each subcategory gets its own independent pass through the PGN file(s), reading
+games in small batches (default 100) to keep memory low.  Per-subcategory RNG
+(derived from master seed via SHA-256) controls within-batch shuffling so each
+subcategory samples different positions even from the same games.
 
 Features:
-  - Per-subcategory seed derived from master seed → different subcategories
-    make independent random choices, avoiding correlated position overlap.
-  - Per-game cap (default 3) per subcategory → diversity across games/phases.
+  - Per-subcategory seed derived from master seed (SHA-256).
+  - Independent PGN pass per subcategory (games read in batches, not all at once).
+  - Per-game cap (default 3) → within a game, randomly pick up to 3 positions.
   - One move per position per subcategory → maximises position diversity.
   - --subcategories flag → run a subset (for parallel jobs or rare types).
 
 Usage:
-    # All subcategories at once:
+    # All subcategories at once (writes one .jsonl per subcategory):
     python extract_balanced_eval.py \
         --pgn_paths data/lichess_2013-01.pgn data/lichess_2013-02.pgn \
-        --out_path data/eval_binary_balanced.jsonl \
-        --target 200 --max_games 5000 --seed 42
+        --out_dir eval_legal_binary/data \
+        --target 200 --seed 42
 
     # Just a few rare ones (can scan more games):
     python extract_balanced_eval.py \
         --pgn_paths data/big.pgn \
-        --out_path data/eval_ep_wrong_pawn.jsonl \
+        --out_dir eval_legal_binary/data \
         --subcategories ep_wrong_pawn non_king_double_check promo_push_blocked \
         --target 200 --max_games 100000 --seed 42
 """
@@ -33,9 +34,9 @@ import argparse
 import hashlib
 import json
 import random
-from collections import Counter, defaultdict
+from collections import Counter
 from pathlib import Path
-from typing import Dict, List, Set
+from typing import Dict, List, Optional, Set, Tuple
 
 import chess
 import chess.pgn
@@ -54,120 +55,122 @@ from legal_move_puzzles import (
     _gen_pawn_double_push_wrong_rank, _gen_pawn_double_push_blocked,
     _gen_pawn_push_onto_piece, _gen_pawn_diagonal_to_empty,
     _gen_pawn_capture_friendly, _gen_castling_path_occupied,
+    _gen_castling_no_rights, _gen_ep_pinned,
     _gen_wrong_geometry,
 )
 
 ALL_SUBCATEGORIES = sorted(SUBCATEGORY_TO_CATEGORY.keys())
 
 
-# ── Position scanning ───────────────────────────────────────────────────────
+# ── Position scanning (for a single target subcategory) ─────────────────────
 
 
-def extract_position_subcategories(
+def extract_subcategory_moves(
     board: chess.Board,
-    wanted: Set[str],
-) -> Dict[str, List[str]]:
-    """Return {subcategory: [uci, ...]} for wanted types present in this position.
-
-    Only computes generators relevant to the wanted set for efficiency.
-    """
+    target_sub: str,
+) -> Optional[List[str]]:
+    """Return list of UCI moves for target_sub in this position, or None."""
     legal_ucis = set(m.uci() for m in board.legal_moves)
-    result: Dict[str, List[str]] = defaultdict(list)
-    seen_illegal: Set[str] = set()
+    category = SUBCATEGORY_TO_CATEGORY[target_sub]
 
-    # Which families of generators do we need?
-    need_ep = bool(wanted & {"ep_fake_diagonal", "ep_wrong_pawn"})
-    need_check = bool(wanted & {"king_to_attacked", "castling_in_check", "non_evasion_in_check"})
-    need_dc = bool(wanted & {"king_to_attacked", "non_king_double_check", "castling_in_check"})
-    need_ik = bool(wanted & {"king_to_attacked", "castling_through_attacked"})
-    need_pin = "pin_breaking" in wanted
-    need_promo = bool(wanted & {"promo_push_blocked", "promo_capture_empty"})
-    need_legal = bool(wanted & {
-        "legal_move", "legal_capture", "legal_castling", "legal_en_passant",
-        "legal_promotion", "legal_check", "legal_king_escape",
-        "legal_capture_checker", "legal_block_check",
-    })
-    need_general = bool(wanted & {
-        "backward_pawn", "friendly_fire", "blocked_sliding",
-        "pawn_double_wrong_rank", "pawn_double_push_blocked",
-        "pawn_push_onto_piece", "pawn_diagonal_to_empty",
-        "pawn_capture_friendly", "wrong_ep",
-        "castling_path_occupied",
-        "wrong_geometry_knight", "wrong_geometry_bishop",
-        "wrong_geometry_rook", "wrong_geometry_queen", "wrong_geometry_king",
-    })
+    # ── Legal subcategories ──
+    if category == "legal":
+        matches = []
+        for m in board.legal_moves:
+            if classify_legal_move(board, m) == target_sub:
+                matches.append(m.uci())
+        return matches if matches else None
 
-    def _add_illegal(uci: str, t: str):
-        if t in wanted and uci not in legal_ucis and uci not in seen_illegal:
-            seen_illegal.add(uci)
-            result[t].append(uci)
+    # ── Illegal subcategories ──
+    seen: Set[str] = set()
+    matches: List[str] = []
 
-    # ── Category-specific illegals ──
-    if need_ep:
+    def _collect(pairs):
+        for uci, t in pairs:
+            if t == target_sub and uci not in legal_ucis and uci not in seen:
+                seen.add(uci)
+                matches.append(uci)
+
+    # Category-specific generators
+    if target_sub in ("ep_fake_diagonal", "ep_wrong_pawn"):
         ep = detect_en_passant(board)
         if ep:
-            for uci, t in build_en_passant_illegals(board, ep):
-                _add_illegal(uci, t)
+            _collect(build_en_passant_illegals(board, ep))
 
-    if need_dc or need_check:
+    elif target_sub in ("non_king_double_check",):
         dc = detect_double_check(board)
-        if dc and need_dc:
-            for uci, t in build_double_check_illegals(board, dc):
-                _add_illegal(uci, t)
-        elif not dc and board.is_check() and need_check:
+        if dc:
+            _collect(build_double_check_illegals(board, dc))
+
+    elif target_sub == "non_evasion_in_check":
+        if board.is_check():
+            dc = detect_double_check(board)
+            if not dc:
+                ci = analyze_check(board)
+                if ci and ci.evasion_types >= 2:
+                    _collect(build_check_candidates(board, ci))
+
+    elif target_sub in ("king_to_attacked", "castling_in_check"):
+        # Can come from check, double_check, or illegal_king
+        dc = detect_double_check(board)
+        if dc:
+            _collect(build_double_check_illegals(board, dc))
+        elif board.is_check():
             ci = analyze_check(board)
             if ci and ci.evasion_types >= 2:
-                for uci, t in build_check_candidates(board, ci):
-                    _add_illegal(uci, t)
+                _collect(build_check_candidates(board, ci))
+        if not board.is_check():
+            ik = detect_illegal_king_moves(board)
+            if ik:
+                _collect(build_illegal_king_illegals(board, ik))
 
-    if need_ik and not board.is_check():
-        ik = detect_illegal_king_moves(board)
-        if ik:
-            for uci, t in build_illegal_king_illegals(board, ik):
-                _add_illegal(uci, t)
+    elif target_sub == "castling_through_attacked":
+        if not board.is_check():
+            ik = detect_illegal_king_moves(board)
+            if ik:
+                _collect(build_illegal_king_illegals(board, ik))
 
-    if need_pin:
+    elif target_sub == "pin_breaking":
         pin = detect_pin(board)
         if pin:
-            for uci, t in build_pin_illegals(board, pin):
-                _add_illegal(uci, t)
+            _collect(build_pin_illegals(board, pin))
 
-    if need_promo:
+    elif target_sub in ("promo_push_blocked", "promo_capture_empty"):
         promo = detect_promotion(board)
         if promo:
-            for uci, t in build_promotion_illegals(board, promo):
-                _add_illegal(uci, t)
+            _collect(build_promotion_illegals(board, promo))
 
-    # ── General distractors ──
-    if need_general:
+    else:
+        # General distractors
         turn = board.turn
-        all_gen = []
-        all_gen += _gen_backward_pawn(board, turn)
-        all_gen += _gen_friendly_fire(board, turn)
-        all_gen += _gen_blocked_sliding(board, turn)
-        all_gen += _gen_pawn_double_push_wrong_rank(board, turn)
-        all_gen += _gen_pawn_double_push_blocked(board, turn)
-        all_gen += _gen_pawn_push_onto_piece(board, turn)
-        all_gen += _gen_pawn_diagonal_to_empty(board, turn)
-        all_gen += _gen_pawn_capture_friendly(board, turn)
-        all_gen += _gen_castling_path_occupied(board, turn)
-        all_gen += _gen_wrong_geometry(board, turn)
+        gen_funcs = {
+            "backward_pawn": _gen_backward_pawn,
+            "friendly_fire": _gen_friendly_fire,
+            "blocked_sliding": _gen_blocked_sliding,
+            "pawn_double_wrong_rank": _gen_pawn_double_push_wrong_rank,
+            "pawn_double_push_blocked": _gen_pawn_double_push_blocked,
+            "pawn_push_onto_piece": _gen_pawn_push_onto_piece,
+            "pawn_diagonal_to_empty": _gen_pawn_diagonal_to_empty,
+            "pawn_capture_friendly": _gen_pawn_capture_friendly,
+            "wrong_ep": _gen_pawn_diagonal_to_empty,  # wrong_ep comes from this generator
+            "castling_path_occupied": _gen_castling_path_occupied,
+            "castling_no_rights": _gen_castling_no_rights,
+            "ep_pinned": _gen_ep_pinned,
+            "wrong_geometry_knight": _gen_wrong_geometry,
+            "wrong_geometry_bishop": _gen_wrong_geometry,
+            "wrong_geometry_rook": _gen_wrong_geometry,
+            "wrong_geometry_queen": _gen_wrong_geometry,
+            "wrong_geometry_king": _gen_wrong_geometry,
+        }
+        func = gen_funcs.get(target_sub)
+        if func:
+            for move, t in func(board, turn):
+                uci = move.uci()
+                if t == target_sub and uci not in legal_ucis and uci not in seen:
+                    seen.add(uci)
+                    matches.append(uci)
 
-        combined_seen = legal_ucis | seen_illegal
-        for move, t in all_gen:
-            uci = move.uci()
-            if t in wanted and uci not in combined_seen:
-                combined_seen.add(uci)
-                result[t].append(uci)
-
-    # ── Legal moves ──
-    if need_legal:
-        for m in board.legal_moves:
-            subcat = classify_legal_move(board, m)
-            if subcat in wanted:
-                result[subcat].append(m.uci())
-
-    return dict(result)
+    return matches if matches else None
 
 
 # ── Seed derivation ─────────────────────────────────────────────────────────
@@ -179,50 +182,155 @@ def derive_seed(master_seed: int, subcategory: str) -> int:
     return int(h[:8], 16)
 
 
-# ── Per-subcategory sampler state ───────────────────────────────────────────
+# ── Batched game iterator ──────────────────────────────────────────────────
 
 
-class SubcategorySampler:
-    """Independently samples positions for one subcategory on-the-fly."""
+def iter_game_batches(
+    pgn_paths: List[str],
+    batch_size: int,
+    max_games: int,
+) -> List[List[chess.pgn.Game]]:
+    """Yield batches of games from PGN files. Returns list of batches."""
+    batches: List[List[chess.pgn.Game]] = []
+    batch: List[chess.pgn.Game] = []
+    total = 0
 
-    def __init__(self, subcategory: str, master_seed: int,
-                 target: int, per_game_cap: int):
-        self.subcategory = subcategory
-        self.target = target
-        self.per_game_cap = per_game_cap
-        self.rng = random.Random(derive_seed(master_seed, subcategory))
-        self.label = "legal" if SUBCATEGORY_TO_CATEGORY[subcategory] == "legal" else "illegal"
-        self.category = SUBCATEGORY_TO_CATEGORY[subcategory]
-        self.rows: List[dict] = []
-        self.game_counts: Dict[int, int] = Counter()
+    for pgn_path in pgn_paths:
+        if total >= max_games:
+            break
+        with open(pgn_path, "r", encoding="utf-8", errors="ignore") as f:
+            while total < max_games:
+                game = chess.pgn.read_game(f)
+                if game is None:
+                    break
+                batch.append(game)
+                total += 1
+                if len(batch) >= batch_size:
+                    batches.append(batch)
+                    batch = []
 
-    @property
-    def full(self) -> bool:
-        return len(self.rows) >= self.target
+    if batch:
+        batches.append(batch)
 
-    def offer(self, game_idx: int, fen: str, phase: str, ucis: List[str]) -> bool:
-        """Offer a candidate position. Returns True if accepted."""
-        if self.full:
-            return False
-        if self.game_counts[game_idx] >= self.per_game_cap:
-            return False
+    return batches, total
 
-        # Pick one random move from this position
-        move_uci = self.rng.choice(ucis)
-        board = chess.Board(fen)
-        move_san = move_to_san(board, move_uci)
 
-        self.rows.append({
-            "fen": fen,
-            "move_uci": move_uci,
-            "move_san": move_san,
-            "label": self.label,
-            "category": self.category,
-            "subcategory": self.subcategory,
-            "phase": phase,
-        })
-        self.game_counts[game_idx] += 1
-        return True
+# ── Process a single game for a subcategory ────────────────────────────────
+
+
+def scan_game(
+    game: chess.pgn.Game,
+    subcat: str,
+) -> List[Tuple[str, str, List[str]]]:
+    """Return list of (fen, phase, [ucis]) for positions matching subcat."""
+    board = game.board()
+    last_move = None
+    candidates: List[Tuple[str, str, List[str]]] = []
+
+    for game_move in game.mainline_moves():
+        if last_move is not None:
+            ucis = extract_subcategory_moves(board, subcat)
+            if ucis:
+                candidates.append((board.fen(en_passant="xfen"), get_phase(board), ucis))
+        board.push(game_move)
+        last_move = game_move
+
+    return candidates
+
+
+# ── Per-subcategory extraction (streaming batches) ─────────────────────────
+
+
+def extract_for_subcategory(
+    subcat: str,
+    pgn_paths: List[str],
+    master_seed: int,
+    target: int,
+    per_game_cap: int,
+    batch_size: int,
+    max_games: int,
+) -> List[dict]:
+    """Independent PGN pass: read in batches, shuffle within batch, collect."""
+    seed = derive_seed(master_seed, subcat)
+    rng = random.Random(seed)
+
+    label = "legal" if SUBCATEGORY_TO_CATEGORY[subcat] == "legal" else "illegal"
+    category = SUBCATEGORY_TO_CATEGORY[subcat]
+
+    collected: List[dict] = []
+    total_games = 0
+
+    for pgn_path in pgn_paths:
+        if len(collected) >= target or total_games >= max_games:
+            break
+
+        with open(pgn_path, "r", encoding="utf-8", errors="ignore") as f:
+            batch: List[chess.pgn.Game] = []
+
+            while len(collected) < target and total_games < max_games:
+                game = chess.pgn.read_game(f)
+                if game is None:
+                    break
+                batch.append(game)
+                total_games += 1
+
+                # Process when batch is full
+                if len(batch) >= batch_size:
+                    _process_batch(batch, subcat, rng, label, category,
+                                   per_game_cap, target, collected)
+                    print(f"    {subcat}: {len(collected)}/{target} after {total_games} games", flush=True)
+                    batch = []
+
+            # Process remaining games in partial batch
+            if batch and len(collected) < target:
+                _process_batch(batch, subcat, rng, label, category,
+                               per_game_cap, target, collected)
+                print(f"    {subcat}: {len(collected)}/{target} after {total_games} games", flush=True)
+
+    return collected
+
+
+def _process_batch(
+    batch: List[chess.pgn.Game],
+    subcat: str,
+    rng: random.Random,
+    label: str,
+    category: str,
+    per_game_cap: int,
+    target: int,
+    collected: List[dict],
+) -> None:
+    """Shuffle batch with subcategory RNG, scan games, collect positions."""
+    # Shuffle game order within this batch
+    indices = list(range(len(batch)))
+    rng.shuffle(indices)
+
+    for idx in indices:
+        if len(collected) >= target:
+            return
+
+        candidates = scan_game(batch[idx], subcat)
+        if not candidates:
+            continue
+
+        # Randomly pick up to per_game_cap positions
+        rng.shuffle(candidates)
+        for fen, phase, ucis in candidates[:per_game_cap]:
+            move_uci = rng.choice(ucis)
+            board_tmp = chess.Board(fen)
+            move_san = move_to_san(board_tmp, move_uci)
+
+            collected.append({
+                "fen": fen,
+                "move_uci": move_uci,
+                "move_san": move_san,
+                "label": label,
+                "category": category,
+                "subcategory": subcat,
+                "phase": phase,
+            })
+            if len(collected) >= target:
+                return
 
 
 # ── Main ────────────────────────────────────────────────────────────────────
@@ -234,14 +342,16 @@ def main():
     )
     parser.add_argument("--pgn_paths", type=str, nargs="+", required=True,
                         help="PGN file(s) to scan")
-    parser.add_argument("--out_path", type=str, required=True,
-                        help="Output JSONL path")
+    parser.add_argument("--out_dir", type=str, required=True,
+                        help="Output directory (one JSONL per subcategory)")
     parser.add_argument("--target", type=int, default=200,
                         help="Target (fen, move) pairs per subcategory (default: 200)")
-    parser.add_argument("--max_games", type=int, default=50000,
-                        help="Max total games to scan across all PGNs")
+    parser.add_argument("--max_games", type=int, default=100000,
+                        help="Max total games to scan per subcategory")
+    parser.add_argument("--batch_size", type=int, default=100,
+                        help="Games to read per batch (default: 100)")
     parser.add_argument("--per_game_cap", type=int, default=3,
-                        help="Max positions per (game, subcategory) pair (default: 3)")
+                        help="Max positions per game per subcategory (default: 3)")
     parser.add_argument("--seed", type=int, default=42, help="Master random seed")
     parser.add_argument("--subcategories", type=str, nargs="*", default=None,
                         help="Subset of subcategories to extract (default: all)")
@@ -257,105 +367,40 @@ def main():
         active_subs = ALL_SUBCATEGORIES
 
     print(f"Extracting {len(active_subs)} subcategories, target {args.target} each")
+    print(f"Batch size: {args.batch_size}, max games per subcategory: {args.max_games}\n")
 
-    # Create one sampler per subcategory
-    samplers = {
-        s: SubcategorySampler(s, args.seed, args.target, args.per_game_cap)
-        for s in active_subs
-    }
-    wanted = set(active_subs)
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    # ── Single PGN pass ──
+    summary = {}
 
-    total_games = 0
-    total_positions = 0
+    for i, subcat in enumerate(active_subs):
+        rows = extract_for_subcategory(
+            subcat, args.pgn_paths, args.seed, args.target,
+            args.per_game_cap, args.batch_size, args.max_games,
+        )
+        summary[subcat] = rows
 
-    for pgn_path in args.pgn_paths:
-        if total_games >= args.max_games:
-            break
-        # Check if all samplers are full
-        if all(samplers[s].full for s in active_subs):
-            break
-        print(f"Scanning {pgn_path} ...")
+        # Write per-subcategory file
+        out_file = out_dir / f"{subcat}.jsonl"
+        with out_file.open("w") as fout:
+            for row in rows:
+                fout.write(json.dumps(row) + "\n")
 
-        with open(pgn_path, "r", encoding="utf-8", errors="ignore") as f:
-            while total_games < args.max_games:
-                game = chess.pgn.read_game(f)
-                if game is None:
-                    break
-
-                game_idx = total_games
-                board = game.board()
-                last_move = None
-
-                # Figure out which subcategories still need data
-                still_needed = {s for s in active_subs if not samplers[s].full}
-                if not still_needed:
-                    break
-
-                for game_move in game.mainline_moves():
-                    if last_move is not None:
-                        total_positions += 1
-                        subcats = extract_position_subcategories(board, still_needed)
-                        if subcats:
-                            fen = board.fen()
-                            phase = get_phase(board)
-                            for subcat, ucis in subcats.items():
-                                samplers[subcat].offer(game_idx, fen, phase, ucis)
-
-                    board.push(game_move)
-                    last_move = game_move
-
-                total_games += 1
-                if total_games % 1000 == 0:
-                    filled = sum(1 for s in active_subs if samplers[s].full)
-                    still = len(active_subs) - filled
-                    print(f"  {total_games} games, {total_positions} positions | "
-                          f"{filled}/{len(active_subs)} full, {still} remaining")
-
-                    # Recalculate what we still need (for efficiency)
-                    still_needed = {s for s in active_subs if not samplers[s].full}
-
-    # ── Write output ──
-
-    out_path = Path(args.out_path)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-
-    all_rows = []
-    for s in active_subs:
-        all_rows.extend(samplers[s].rows)
-
-    # Shuffle so subcategories are interleaved
-    master_rng = random.Random(args.seed)
-    master_rng.shuffle(all_rows)
-
-    with out_path.open("w") as fout:
-        for row in all_rows:
-            fout.write(json.dumps(row) + "\n")
-
-    # ── Report ──
-
-    print(f"\nScanned {total_games} games, {total_positions} positions")
-    print(f"\n{'Subcategory':<30} {'Selected':>8} / {'Target':>6}  {'Phase distribution'}")
-    print("-" * 85)
-    total_written = 0
-    shortfall = []
-    for subcat in active_subs:
-        rows = samplers[subcat].rows
-        n = len(rows)
-        total_written += n
         phases = Counter(r["phase"] for r in rows)
         phase_str = "  ".join(f"{p}:{c}" for p, c in sorted(phases.items()))
-        marker = "" if n >= args.target else f"  ** need {args.target - n} more"
-        print(f"  {subcat:<30} {n:>6} / {args.target:>6}  {phase_str}{marker}")
-        if n < args.target:
-            shortfall.append((subcat, args.target - n))
+        status = "OK" if len(rows) >= args.target else f"need {args.target - len(rows)} more"
+        print(f"  [{i+1}/{len(active_subs)}] {subcat:<30} {len(rows):>4} / {args.target}  {phase_str}  {status}")
 
-    print(f"\nTotal rows: {total_written}")
-    print(f"Output: {out_path}")
+    # ── Summary ──
+    total = sum(len(rows) for rows in summary.values())
+    shortfall = [s for s, rows in summary.items() if len(rows) < args.target]
+
+    print(f"\nTotal rows: {total}")
+    print(f"Output dir: {out_dir}/  ({len(active_subs)} files)")
 
     if shortfall:
-        print(f"\n{len(shortfall)} subcategories below target.")
+        print(f"\n{len(shortfall)} subcategories below target: {', '.join(shortfall)}")
         print("Increase --max_games or add more PGN files.")
 
 

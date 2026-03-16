@@ -244,6 +244,43 @@ def describe_illegal_move(
             move=san, blocker_desc=blocker_desc,
         )
 
+    elif move_type == "castling_no_rights":
+        from legal_moves import CASTLE_INFO
+        side = "kingside" if move.to_square in (chess.G1, chess.G8) else "queenside"
+        # Determine which piece lost the rights — we can't know for certain,
+        # so use a generic description based on side.
+        lost_piece = f"{side} rook or king"
+        return templates["castling_no_rights"].format(move=san, lost_piece=lost_piece)
+
+    elif move_type == "ep_pinned":
+        # The captured pawn is on the same file as ep_square, one rank behind
+        captured_sq = chess.square(
+            chess.square_file(move.to_square),
+            chess.square_rank(move.from_square),
+        )
+        captured_square = chess.square_name(captured_sq)
+        # Find the lateral attacker revealed by removing both pawns
+        king_sq = board.king(board.turn)
+        king_rank = chess.square_rank(king_sq)
+        attacker_desc = "an attack"
+        if king_rank == chess.square_rank(move.from_square):
+            for direction in [-1, 1]:
+                sq = king_sq
+                while True:
+                    sq += direction
+                    if sq < 0 or sq > 63 or chess.square_rank(sq) != king_rank:
+                        break
+                    if sq == move.from_square or sq == captured_sq:
+                        continue
+                    p = board.piece_at(sq)
+                    if p is not None:
+                        if p.color != board.turn and p.piece_type in (chess.ROOK, chess.QUEEN):
+                            attacker_desc = piece_desc(board, sq)
+                        break
+        return templates["ep_pinned"].format(
+            move=san, captured_square=captured_square, attacker_desc=attacker_desc,
+        )
+
     elif move_type.startswith("wrong_geometry"):
         reason = GEOMETRY_REASONS.get(move_type, "this geometry is not valid for this piece")
         return templates["wrong_geometry"].format(
@@ -393,7 +430,8 @@ def main():
         "pawn_diagonal_to_empty", "pawn_capture_friendly",
         "wrong_geometry",
         "non_evasion_in_check", "pawn_double_push_blocked",
-        "castling_path_occupied", "wrong_ep",
+        "castling_path_occupied", "castling_no_rights",
+        "wrong_ep", "ep_pinned",
     ]
     missing = [t for t in required if t not in templates]
     if missing:

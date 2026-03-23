@@ -458,6 +458,292 @@ def verify_atoms(entry, parsed, model="gpt-4o-mini"):
     return {"results": results, "all_ok": all_ok}
 
 
+# ── Filter prompt ────────────────────────────────────────────────────────
+
+FILTER_PROMPT = """\
+You are filtering extracted reasoning atoms from chess commentary.
+
+You will receive the FULL extracted JSON for a position (FEN, move played,
+engine lines, original commentary, reasoning atoms, alternative section, etc.)
+
+You have TWO jobs:
+1. Classify each REASONING atom (keep / contextualize / move_to_alternative / remove)
+2. Review each EXISTING ALTERNATIVE atom (keep / remove / paraphrase)
+
+─── REASONING ATOMS ───
+
+KEEP an atom if it states a concrete, verifiable positional fact about what
+the move does: attacks, defends, controls, pins, blocks, develops, opens/
+closes lines, creates threats, prevents opponent plans, explains why a move
+is bad, etc.
+
+CONTEXTUALIZE an atom that has useful content but is not self-contained on
+its own. An atom is not self-contained if it references a consequence,
+position, or piece without enough context to verify it independently.
+
+Each atom stays SEPARATE — do NOT combine multiple atoms into one. Instead,
+add the missing context so each atom is independently verifiable.
+  Original: "On e4 the knight controls d6 and f6"
+  Contextualized: "After Nd2, the knight on e4 would control d6 and f6."
+Output: {"action": "contextualize", "new_text": "After Nd2, ..."}
+
+IMPORTANT: Only add REFERENTIAL context — which move, which piece, which
+square, which position. Do NOT add new chess claims, analysis, or
+consequences that were not in the original atom. The goal is to make the
+existing claim self-contained, not to enrich it.
+
+MOVE_TO_ALTERNATIVE if the atom describes an ALTERNATIVE move (a move NOT
+played) and its consequences.
+  Output: {"action": "move_to_alternative", "move": "Bf4", "text": "..."}
+  You may paraphrase the text so it reads naturally in the alternative section.
+
+Conclusion vs. detailed analysis of alternatives:
+- A CONCLUSION that the played move avoids or is better than an alternative
+  is KEEP: "Qh4 avoids the inferior Qg5" -> KEEP.
+- A DETAILED ANALYSIS of what happens after the alternative move is
+  MOVE_TO_ALTERNATIVE: "After 32.Qc1 Nxd4 33.Bxd4 Rxd4, Black threatens
+  Rd3" -> MOVE_TO_ALTERNATIVE for Qc1.
+- When an atom MIXES both (conclusion + detailed line), SPLIT it using
+  kept_brief:
+  {"action": "move_to_alternative", "move": "Qc1",
+   "text": "After 32.Qc1 Nxd4 33.Bxd4 Rxd4, Black threatens Rd3.",
+   "kept_brief": "Qb2 avoids Qc1, which leads to dangerous threats on the d-file."}
+  kept_brief stays in reasoning, text goes to the alternative.
+
+DEDUPLICATION: Check the existing alternative section before adding. If an
+alternative for that move already exists with equivalent content, do NOT add
+duplicate text. You may instead paraphrase or remove the existing atom via
+review_alternatives (see below).
+
+REMOVE an atom ONLY if it is a generic label with no concrete positional
+content. "Nbd2 is a typical Colle Attack manoeuvre." — naming an opening or
+saying "typical/standard" without any positional claim is not a useful atom.
+
+─── EXISTING ALTERNATIVE ATOMS ───
+
+Review each atom in the existing alternative section(s). For each, choose:
+- keep: leave as-is
+- remove: delete (duplicate, or superseded by a moved reasoning atom)
+- paraphrase: rewrite for clarity (provide new_text)
+
+Output these in the "review_alternatives" array.
+
+─── OUTPUT FORMAT ───
+
+Output ONLY valid JSON:
+{"atoms": [
+  {"index": 0, "text": "...", "action": "keep"},
+  {"index": 1, "text": "...", "action": "contextualize", "new_text": "..."},
+  {"index": 2, "text": "...", "action": "move_to_alternative", "move": "Qc1",
+   "text": "detailed line...", "kept_brief": "brief conclusion..."},
+  {"index": 3, "text": "...", "action": "remove", "reason": "generic label"}
+ ],
+ "review_alternatives": [
+  {"move": "Qc1", "index": 0, "action": "keep"},
+  {"move": "Qc1", "index": 1, "action": "remove", "reason": "superseded"},
+  {"move": "Bf4", "index": 0, "action": "paraphrase", "new_text": "..."}
+ ]
+}
+
+review_alternatives uses the move name and 0-based index within that
+alternative's reasoning array. Omit review_alternatives if there are no
+existing alternatives.
+
+Be conservative: when in doubt, KEEP. Prefer CONTEXTUALIZE over REMOVE when
+an atom has useful content but just lacks context. Prefer MOVE_TO_ALTERNATIVE
+over REMOVE when the atom is about a different move.
+"""
+
+
+# ── Filter helpers ───────────────────────────────────────────────────────
+
+def _normalize_alts(alt):
+    """Normalize alternative field to a list of {move, reasoning, ...} dicts."""
+    if not alt:
+        return []
+    if isinstance(alt, list):
+        return [dict(a) for a in alt]
+    return [dict(alt)]
+
+
+def _alt_quality(alt_move_san, engine_lines):
+    """Compute quality label for an alternative move from engine lines."""
+    top_lines = [l for l in engine_lines if l.get('is_top', True)]
+    if not top_lines:
+        return None
+    best = top_lines[0]
+    alt_line = next((l for l in engine_lines if l['move_san'] == alt_move_san), None)
+    if alt_line is None:
+        return None
+    best_wp = cp_to_winpct(best['cp'])
+    alt_wp = cp_to_winpct(alt_line['cp'])
+    loss = abs(best_wp - alt_wp)
+    if loss > 30:
+        return 'blunder'
+    elif loss > 20:
+        return 'mistake'
+    elif loss > 10:
+        return 'inaccuracy'
+    return 'good'
+
+
+def filter_atoms(row, client, model=DEFAULT_MODEL):
+    """Classify each reasoning atom as keep/remove/contextualize/move_to_alternative."""
+    extracted = row['extracted']
+    reasoning = extracted.get('reasoning', [])
+    alt = extracted.get('alternative')
+
+    all_atoms = [{'index': i, 'text': a} for i, a in enumerate(reasoning)]
+
+    if not all_atoms:
+        return {'atoms': [], 'filtered_reasoning': [],
+                'alternatives': _normalize_alts(alt), 'new_alternatives': [],
+                'review_alternatives': []}
+
+    context = {
+        'fen': row['fen'],
+        'move_uci': row['move_uci'],
+        'move_san': row.get('move_san', ''),
+        'annotation': row['annotation'],
+        'quality': row.get('quality', ''),
+        'wp_loss': row.get('wp_loss', 0),
+        'engine_lines': [
+            {'move_san': l['move_san'], 'eval': l['eval'],
+             'pv_san': l['pv_san'], 'is_top': l.get('is_top', True)}
+            for l in row.get('engine_lines', [])
+        ],
+        'reasoning': reasoning,
+        'alternative': alt,
+    }
+
+    atoms_text = '\n'.join(f'{a["index"]}. "{a["text"]}"' for a in all_atoms)
+    user_msg = (
+        f'Position data:\n```json\n{json.dumps(context, indent=2)}\n```\n\n'
+        f'Reasoning atoms to classify:\n{atoms_text}'
+    )
+
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[
+            {'role': 'system', 'content': FILTER_PROMPT},
+            {'role': 'user', 'content': user_msg},
+        ],
+        temperature=0,
+        max_completion_tokens=2048,
+    )
+    text = resp.choices[0].message.content.strip()
+
+    try:
+        result = parse_json_output(text)
+    except Exception:
+        return {'atoms': [], 'error': 'JSON parse error', 'raw': text,
+                'filtered_reasoning': reasoning,
+                'alternatives': _normalize_alts(alt), 'new_alternatives': [],
+                'review_alternatives': []}
+
+    if 'atoms' not in result:
+        return {'atoms': [], 'error': 'no atoms key',
+                'filtered_reasoning': reasoning,
+                'alternatives': _normalize_alts(alt), 'new_alternatives': [],
+                'review_alternatives': []}
+
+    atoms_by_idx = {a['index']: a for a in result['atoms']}
+    moved_to_alt = []
+
+    for a in result['atoms']:
+        if a.get('action') == 'move_to_alternative':
+            moved_to_alt.append({
+                'move': a.get('move', '?'),
+                'text': a.get('text', ''),
+            })
+
+    filtered_reasoning = []
+    for atom_info in all_atoms:
+        idx = atom_info['index']
+        a = atoms_by_idx.get(idx, {})
+        action = a.get('action', 'keep')
+
+        if action == 'remove':
+            continue
+        if action == 'move_to_alternative':
+            if a.get('kept_brief'):
+                filtered_reasoning.append(a['kept_brief'])
+            continue
+        if action == 'contextualize' and a.get('new_text'):
+            filtered_reasoning.append(a['new_text'])
+        else:
+            filtered_reasoning.append(atom_info['text'])
+
+    # Apply review_alternatives to existing alternatives
+    alternatives = _normalize_alts(alt)
+    review_alts = result.get('review_alternatives', [])
+
+    alt_reviews = {}
+    for ra in review_alts:
+        key = (ra.get('move', ''), ra.get('index', 0))
+        alt_reviews[key] = ra
+
+    for a in alternatives:
+        move_name = a['move']
+        old_reasoning = a.get('reasoning', [])
+        new_reasoning = []
+        for i, atom_text in enumerate(old_reasoning):
+            ra = alt_reviews.get((move_name, i))
+            if ra:
+                action = ra.get('action', 'keep')
+                if action == 'remove':
+                    continue
+                elif action == 'paraphrase' and ra.get('new_text'):
+                    new_reasoning.append(ra['new_text'])
+                else:
+                    new_reasoning.append(atom_text)
+            else:
+                new_reasoning.append(atom_text)
+        a['reasoning'] = new_reasoning
+
+    for ma in moved_to_alt:
+        move_name = ma['move']
+        existing = next((a for a in alternatives if a['move'] == move_name), None)
+        if existing:
+            existing['reasoning'].append(ma['text'])
+        else:
+            alternatives.append({'move': move_name, 'reasoning': [ma['text']]})
+
+    alternatives = [a for a in alternatives if a.get('reasoning')]
+
+    return {
+        'atoms': result['atoms'],
+        'filtered_reasoning': filtered_reasoning,
+        'alternatives': alternatives,
+        'new_alternatives': moved_to_alt,
+        'review_alternatives': review_alts,
+    }
+
+
+def run_filter(row, client, model=DEFAULT_MODEL):
+    """Run filter and build the output row with quality-labeled alternatives."""
+    result = filter_atoms(row, client, model=model)
+
+    out_row = dict(row)
+    filtered_extracted = dict(row['extracted'])
+    filtered_extracted['reasoning'] = result['filtered_reasoning']
+    alts = result['alternatives']
+    filtered_extracted['alternative'] = alts[0] if len(alts) == 1 else (alts or None)
+    out_row['extracted'] = filtered_extracted
+
+    engine_lines = row.get('engine_lines', [])
+    alt_field = filtered_extracted.get('alternative')
+    if alt_field and engine_lines:
+        alt_list = alt_field if isinstance(alt_field, list) else [alt_field]
+        for a in alt_list:
+            if 'quality' not in a and a.get('move'):
+                q = _alt_quality(a['move'], engine_lines)
+                if q:
+                    a['quality'] = q
+
+    return result, out_row
+
+
 # ── Commands ──────────────────────────────────────────────────────────────
 
 def cmd_prepare(args):
@@ -808,6 +1094,80 @@ def cmd_sync(args):
     print(f"\nDone. {n_included} included, {n_excluded} excluded.")
 
 
+def cmd_filter(args):
+    """Filter extracted atoms: keep/contextualize/move_to_alternative/remove."""
+    import openai
+    client = openai.OpenAI()
+
+    with open(args.input) as f:
+        all_rows = [json.loads(line) for line in f]
+    print(f"Loaded {len(all_rows)} positions from {args.input}")
+
+    # Resume
+    already_done = set()
+    for path in [args.out_included, args.out_excluded]:
+        if os.path.exists(path):
+            with open(path) as f:
+                for line in f:
+                    already_done.add(json.loads(line)['position_number'])
+    if already_done:
+        print(f"Resuming: {len(already_done)} already done")
+
+    n_processed = 0
+    n_atoms_before = 0
+    n_atoms_after = 0
+    n_ctx = 0
+    n_moved = 0
+    n_excluded = 0
+
+    for row in all_rows:
+        if row['position_number'] in already_done:
+            continue
+
+        board = chess.Board(row['fen'])
+        san = board.san(chess.Move.from_uci(row['move_uci']))
+
+        result, out_row = run_filter(row, client, model=args.model)
+
+        old_reasoning = row['extracted'].get('reasoning', [])
+        new_reasoning = result['filtered_reasoning']
+        n_before = len(old_reasoning)
+        n_after = len(new_reasoning)
+        n_atoms_before += n_before
+        n_atoms_after += n_after
+        n_ctx += sum(1 for a in result.get('atoms', [])
+                     if a.get('action') == 'contextualize')
+        n_moved += len(result.get('new_alternatives', []))
+
+        out_row['filter_result'] = result.get('atoms', [])
+
+        if not new_reasoning:
+            out_row['exclude_reason'] = 'no reasoning atoms after filter'
+            with open(args.out_excluded, 'a') as f:
+                f.write(json.dumps(out_row) + '\n')
+            n_excluded += 1
+            print(f"  [{row['position_number']}] {row['game']} — {san}: "
+                  f"EXCLUDED (0 reasoning atoms)")
+        else:
+            with open(args.out_included, 'a') as f:
+                f.write(json.dumps(out_row) + '\n')
+
+        n_processed += 1
+        if n_processed % 50 == 0:
+            print(f"  {n_processed}/{len(all_rows) - len(already_done)} done "
+                  f"({n_atoms_before} -> {n_atoms_after} atoms)")
+        elif n_before != n_after and new_reasoning:
+            print(f"  [{row['position_number']}] {row['game']} — {san}: "
+                  f"{n_before} -> {n_after}")
+
+    print(f"\nDone. {n_processed} positions filtered.")
+    print(f"Included: {n_processed - n_excluded} | Excluded: {n_excluded}")
+    print(f"Atoms: {n_atoms_before} -> {n_atoms_after} "
+          f"({n_atoms_before - n_atoms_after} net removed, "
+          f"{(n_atoms_before - n_atoms_after) / max(n_atoms_before, 1) * 100:.1f}%)")
+    print(f"  Contextualized: {n_ctx}, Moved to alternative: {n_moved}")
+
+
 # ── CLI ───────────────────────────────────────────────────────────────────
 
 def main():
@@ -877,6 +1237,18 @@ def main():
     p_sync.add_argument('--depth', type=int, default=22)
     p_sync.add_argument('--verify', action='store_true')
 
+    # -- filter --
+    p_filt = sub.add_parser('filter',
+        help='Filter extracted atoms: keep/contextualize/move_to_alternative/remove')
+    p_filt.add_argument('--input', required=True,
+                        help='Input JSONL (included.jsonl from process step)')
+    p_filt.add_argument('--out-included', required=True,
+                        help='Output JSONL for positions with reasoning atoms')
+    p_filt.add_argument('--out-excluded', required=True,
+                        help='Output JSONL for positions with 0 reasoning atoms')
+    p_filt.add_argument('--model', default=DEFAULT_MODEL,
+                        help='Model for filter LLM (default: gpt-5.4)')
+
     args = parser.parse_args()
 
     if args.command == 'prepare':
@@ -889,6 +1261,8 @@ def main():
         cmd_process(args)
     elif args.command == 'sync':
         cmd_sync(args)
+    elif args.command == 'filter':
+        cmd_filter(args)
 
 
 if __name__ == '__main__':

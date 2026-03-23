@@ -20,6 +20,9 @@ logical_chess.jsonl (1832 positions)
   extract_all.py process   ← postprocess filter → included.jsonl / excluded.jsonl
         │
         ▼
+  extract_all.py filter    ← LLM filter pass → included_filtered.jsonl / excluded_filtered.jsonl
+        │
+        ▼
   train.jsonl + test_unfiltered.jsonl  ← game-wise split (no leakage)
         │
         ▼
@@ -58,6 +61,14 @@ python evaluation/extract_all.py process \
 
 `sync` subcommand available for small runs without the batch API.
 
+```bash
+# 5. Filter atoms: contextualize, move to alternative, deduplicate
+python evaluation/extract_all.py filter \
+    --input evaluation/data/logical_chess_atomize/included.jsonl \
+    --out-included evaluation/data/logical_chess_atomize/included_filtered.jsonl \
+    --out-excluded evaluation/data/logical_chess_atomize/excluded_filtered.jsonl
+```
+
 ## Notebooks
 
 | Notebook | Purpose |
@@ -90,6 +101,9 @@ Batch extraction outputs:
 | `batch_output.jsonl` | Raw LLM responses |
 | `included.jsonl` | 1302 positions with extracted atoms (32 games) |
 | `excluded.jsonl` | 530 positions excluded (too minimal, conflicts, etc.) |
+| `included_filtered.jsonl` | Positions after filter pass (atoms cleaned up) |
+| `excluded_filtered.jsonl` | Positions excluded by filter (0 reasoning atoms) |
+| `filter_atoms.ipynb` | Interactive filter notebook (same logic as `extract_all.py filter`) |
 | `train.jsonl` | 992 positions from 24 games (seed=99, game-wise split) |
 | `test_unfiltered.jsonl` | 310 positions from 8 games (seed=99, game-wise split) |
 | `review_gold.ipynb` | Human review UI for test set (randomized order, seed=42) |

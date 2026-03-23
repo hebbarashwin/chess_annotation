@@ -8,32 +8,57 @@ Extract structured atoms from chess commentary and evaluate LLM-generated explan
 logical_chess.jsonl (1832 positions)
         │
         ▼
-  extract_all.py prepare   ← Stockfish analysis
+  extract_all.py prepare        ← Stockfish analysis + batch request
         │
         ▼
-  extract_all.py submit    ← OpenAI Batch API
+  extract_all.py submit         ← OpenAI Batch API (50% off)
         │
         ▼
-  extract_all.py collect   ← download results
+  extract_all.py collect        ← download results
         │
         ▼
-  extract_all.py process   ← postprocess filter → included.jsonl / excluded.jsonl
+  extract_all.py process        ← postprocess → included.jsonl / excluded.jsonl
         │
         ▼
-  extract_all.py filter    ← LLM filter pass → included_filtered.jsonl / excluded_filtered.jsonl
+  extract_all.py filter-prepare ← build filter batch request
+        │
+        ▼
+  extract_all.py submit         ← OpenAI Batch API (reuse)
+        │
+        ▼
+  extract_all.py collect        ← download results (reuse)
+        │
+        ▼
+  extract_all.py filter-process ← apply filter → included_filtered.jsonl / excluded_filtered.jsonl
+        │
+        ▼
+  filter_atoms.ipynb            ← interactive review of filter results
         │
         ▼
   train.jsonl + test_unfiltered.jsonl  ← game-wise split (no leakage)
         │
         ▼
-  review_gold.ipynb        ← human review → test_accepted / test_rejected / test_again
+  review_gold.ipynb             ← human review → test_accepted / test_rejected / test_again
 ```
 
 ## Scripts
 
 ### `extract_all.py`
 
-Batch extraction of commentary into structured atoms. No tools — single LLM call per position.
+All stages of the pipeline in one script. Subcommands:
+
+| Subcommand | Description |
+|------------|-------------|
+| `prepare` | Run Stockfish analysis, build batch request + metadata |
+| `submit` | Upload batch file to OpenAI Batch API |
+| `collect` | Poll + download batch results |
+| `process` | Join batch output with metadata, postprocess filter |
+| `sync` | Run extraction synchronously (no batch, direct API) |
+| `filter-prepare` | Build batch request for filter pass |
+| `filter-process` | Join filter batch output, apply filter logic |
+| `filter` | Run filter synchronously (no batch) |
+
+#### Step 1–4: Extract atoms
 
 ```bash
 # 1. Run Stockfish, build batch request
@@ -61,8 +86,18 @@ python evaluation/extract_all.py process \
 
 `sync` subcommand available for small runs without the batch API.
 
+#### Step 5: Filter atoms
+
+LLM second pass to clean up extracted atoms. Actions:
+- **keep** — concrete verifiable fact
+- **contextualize** — add referential context (which move/piece/square) so atom is self-contained
+- **move_to_alternative** — detailed analysis of an alternative move (with optional `kept_brief` for split)
+- **remove** — generic labels only
+
+Also reviews existing alternative atoms (keep/remove/paraphrase) and deduplicates.
+
 ```bash
-# 5a. Filter atoms via Batch API (recommended — 50% off)
+# 5a. Via Batch API (recommended — 50% off)
 python evaluation/extract_all.py filter-prepare \
     --input evaluation/data/logical_chess_atomize/included.jsonl \
     --batch-file evaluation/data/logical_chess_atomize/filter_batch_input.jsonl
@@ -80,7 +115,7 @@ python evaluation/extract_all.py filter-process \
     --out-included evaluation/data/logical_chess_atomize/included_filtered.jsonl \
     --out-excluded evaluation/data/logical_chess_atomize/excluded_filtered.jsonl
 
-# 5b. Or filter synchronously (no batch, direct API)
+# 5b. Or synchronously (no batch, direct API — has resume support)
 python evaluation/extract_all.py filter \
     --input evaluation/data/logical_chess_atomize/included.jsonl \
     --out-included evaluation/data/logical_chess_atomize/included_filtered.jsonl \
@@ -95,6 +130,7 @@ python evaluation/extract_all.py filter \
 | `eval_tools.ipynb` | LLM-as-a-Judge: generate NL commentary, then evaluate via atom-level decomposition → verification → matching. |
 | `compare_contextual.ipynb` | Comparison notebook — contextual atom style (atoms carry full move-sequence prefix). |
 | `compare_flat.ipynb` | Comparison notebook — flat atom style (conclusions only, move sequences in `variation` field). |
+| `filter_atoms.ipynb` | Interactive filter notebook — same logic as `extract_all.py filter`, with visual review. |
 
 ## Data
 
@@ -110,21 +146,21 @@ Source dataset. 1832 annotated positions from *Logical Chess: Move by Move*.
 
 ### `data/logical_chess_atomize/`
 
-Batch extraction outputs:
-
 | File | Description |
 |------|-------------|
-| `batch_input.jsonl` | OpenAI Batch API requests |
+| `batch_input.jsonl` | OpenAI Batch API requests (extraction) |
 | `batch_meta.jsonl` | Metadata (engine lines, wp_loss) keyed by `custom_id` |
-| `batch_output.jsonl` | Raw LLM responses |
+| `batch_output.jsonl` | Raw extraction LLM responses |
 | `included.jsonl` | 1302 positions with extracted atoms (32 games) |
 | `excluded.jsonl` | 530 positions excluded (too minimal, conflicts, etc.) |
+| `filter_batch_input.jsonl` | OpenAI Batch API requests (filter) |
+| `filter_batch_output.jsonl` | Raw filter LLM responses |
 | `included_filtered.jsonl` | Positions after filter pass (atoms cleaned up) |
 | `excluded_filtered.jsonl` | Positions excluded by filter (0 reasoning atoms) |
-| `filter_atoms.ipynb` | Interactive filter notebook (same logic as `extract_all.py filter`) |
-| `train.jsonl` | 992 positions from 24 games (seed=99, game-wise split) |
-| `test_unfiltered.jsonl` | 310 positions from 8 games (seed=99, game-wise split) |
+| `train.jsonl` | Training split (seed=99, game-wise) |
+| `test_unfiltered.jsonl` | Test split (seed=99, game-wise) |
 | `review_gold.ipynb` | Human review UI for test set (randomized order, seed=42) |
+| `filter_atoms.ipynb` | Interactive filter review notebook |
 | `test_accepted.jsonl` | Accepted after review |
 | `test_rejected.jsonl` | Rejected after review |
 | `test_again.jsonl` | Flagged for re-review |
@@ -161,3 +197,4 @@ Batch extraction outputs:
 - **wp_loss**: win-percentage loss from Stockfish eval. `Win% = 50 + 50 * tanh(0.00368208 * cp / 2)`.
 - **Quality**: good (≤10%), inaccuracy (>10%), mistake (>20%), blunder (>30%).
 - **Postprocess filter**: catches quality/engine conflicts, missing reasoning, empty alternatives.
+- **Filter pass**: LLM second pass — contextualize (add referential context), move to alternative (with dedup), remove generic labels. Reviews existing alternatives too.

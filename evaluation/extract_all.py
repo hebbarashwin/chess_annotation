@@ -587,19 +587,13 @@ def _alt_quality(alt_move_san, engine_lines):
     return 'good'
 
 
-def filter_atoms(row, client, model=DEFAULT_MODEL):
-    """Classify each reasoning atom as keep/remove/contextualize/move_to_alternative."""
+def build_filter_messages(row):
+    """Build the system + user messages for one filter request."""
     extracted = row['extracted']
     reasoning = extracted.get('reasoning', [])
     alt = extracted.get('alternative')
 
     all_atoms = [{'index': i, 'text': a} for i, a in enumerate(reasoning)]
-
-    if not all_atoms:
-        return {'atoms': [], 'filtered_reasoning': [],
-                'alternatives': _normalize_alts(alt), 'new_alternatives': [],
-                'review_alternatives': []}
-
     context = {
         'fen': row['fen'],
         'move_uci': row['move_uci'],
@@ -615,39 +609,25 @@ def filter_atoms(row, client, model=DEFAULT_MODEL):
         'reasoning': reasoning,
         'alternative': alt,
     }
-
     atoms_text = '\n'.join(f'{a["index"]}. "{a["text"]}"' for a in all_atoms)
     user_msg = (
         f'Position data:\n```json\n{json.dumps(context, indent=2)}\n```\n\n'
         f'Reasoning atoms to classify:\n{atoms_text}'
     )
+    return [
+        {'role': 'system', 'content': FILTER_PROMPT},
+        {'role': 'user', 'content': user_msg},
+    ]
 
-    resp = client.chat.completions.create(
-        model=model,
-        messages=[
-            {'role': 'system', 'content': FILTER_PROMPT},
-            {'role': 'user', 'content': user_msg},
-        ],
-        temperature=0,
-        max_completion_tokens=2048,
-    )
-    text = resp.choices[0].message.content.strip()
 
-    try:
-        result = parse_json_output(text)
-    except Exception:
-        return {'atoms': [], 'error': 'JSON parse error', 'raw': text,
-                'filtered_reasoning': reasoning,
-                'alternatives': _normalize_alts(alt), 'new_alternatives': [],
-                'review_alternatives': []}
+def apply_filter_result(row, result):
+    """Apply parsed LLM filter result to a row. Returns (filter_info, out_row)."""
+    extracted = row['extracted']
+    reasoning = extracted.get('reasoning', [])
+    alt = extracted.get('alternative')
+    all_atoms = [{'index': i, 'text': a} for i, a in enumerate(reasoning)]
 
-    if 'atoms' not in result:
-        return {'atoms': [], 'error': 'no atoms key',
-                'filtered_reasoning': reasoning,
-                'alternatives': _normalize_alts(alt), 'new_alternatives': [],
-                'review_alternatives': []}
-
-    atoms_by_idx = {a['index']: a for a in result['atoms']}
+    atoms_by_idx = {a['index']: a for a in result.get('atoms', [])}
     moved_to_alt = []
 
     for a in result['atoms']:
@@ -711,26 +691,23 @@ def filter_atoms(row, client, model=DEFAULT_MODEL):
 
     alternatives = [a for a in alternatives if a.get('reasoning')]
 
-    return {
-        'atoms': result['atoms'],
+    filter_info = {
+        'atoms': result.get('atoms', []),
         'filtered_reasoning': filtered_reasoning,
         'alternatives': alternatives,
         'new_alternatives': moved_to_alt,
         'review_alternatives': review_alts,
     }
 
-
-def run_filter(row, client, model=DEFAULT_MODEL):
-    """Run filter and build the output row with quality-labeled alternatives."""
-    result = filter_atoms(row, client, model=model)
-
+    # Build output row
     out_row = dict(row)
     filtered_extracted = dict(row['extracted'])
-    filtered_extracted['reasoning'] = result['filtered_reasoning']
-    alts = result['alternatives']
-    filtered_extracted['alternative'] = alts[0] if len(alts) == 1 else (alts or None)
+    filtered_extracted['reasoning'] = filtered_reasoning
+    filtered_extracted['alternative'] = (
+        alternatives[0] if len(alternatives) == 1 else (alternatives or None))
     out_row['extracted'] = filtered_extracted
 
+    # Add quality labels to alternatives
     engine_lines = row.get('engine_lines', [])
     alt_field = filtered_extracted.get('alternative')
     if alt_field and engine_lines:
@@ -741,7 +718,39 @@ def run_filter(row, client, model=DEFAULT_MODEL):
                 if q:
                     a['quality'] = q
 
-    return result, out_row
+    return filter_info, out_row
+
+
+def filter_atoms(row, client, model=DEFAULT_MODEL):
+    """Run filter synchronously: call LLM + apply result. Returns (filter_info, out_row)."""
+    extracted = row['extracted']
+    reasoning = extracted.get('reasoning', [])
+    alt = extracted.get('alternative')
+
+    if not reasoning:
+        empty_info = {'atoms': [], 'filtered_reasoning': [],
+                      'alternatives': _normalize_alts(alt), 'new_alternatives': [],
+                      'review_alternatives': []}
+        out_row = dict(row)
+        return empty_info, out_row
+
+    messages = build_filter_messages(row)
+    resp = client.chat.completions.create(
+        model=model, messages=messages,
+        temperature=0, max_completion_tokens=2048,
+    )
+    text = resp.choices[0].message.content.strip()
+    result = parse_json_output(text)
+
+    if 'atoms' not in result:
+        # Fallback: keep everything as-is
+        fallback = {'atoms': [], 'filtered_reasoning': reasoning,
+                    'alternatives': _normalize_alts(alt), 'new_alternatives': [],
+                    'review_alternatives': []}
+        out_row = dict(row)
+        return fallback, out_row
+
+    return apply_filter_result(row, result)
 
 
 # ── Commands ──────────────────────────────────────────────────────────────
@@ -1094,8 +1103,133 @@ def cmd_sync(args):
     print(f"\nDone. {n_included} included, {n_excluded} excluded.")
 
 
+def cmd_filter_prepare(args):
+    """Build batch request JSONL for filter pass (no Stockfish needed)."""
+    with open(args.input) as f:
+        all_rows = [json.loads(line) for line in f]
+    print(f"Loaded {len(all_rows)} positions from {args.input}")
+
+    n_written = 0
+    with open(args.batch_file, 'w') as bf:
+        for row in all_rows:
+            reasoning = row['extracted'].get('reasoning', [])
+            if not reasoning:
+                continue
+            custom_id = f"filter-{row['position_number']}"
+            messages = build_filter_messages(row)
+            batch_row = {
+                "custom_id": custom_id,
+                "method": "POST",
+                "url": "/v1/chat/completions",
+                "body": {
+                    "model": args.model,
+                    "messages": messages,
+                    "temperature": 0,
+                    "max_completion_tokens": 2048,
+                },
+            }
+            bf.write(json.dumps(batch_row) + '\n')
+            n_written += 1
+
+    print(f"Wrote {n_written} requests to {args.batch_file}")
+    print(f"  ({len(all_rows) - n_written} skipped — no reasoning atoms)")
+    print(f"\nNext: python evaluation/extract_all.py submit "
+          f"--batch-file {args.batch_file}")
+
+
+def cmd_filter_process(args):
+    """Join filter batch output with original rows, apply filter logic."""
+    # Load original rows keyed by position_number
+    with open(args.input) as f:
+        all_rows = {r['position_number']: r for r in (json.loads(l) for l in f)}
+    print(f"Loaded {len(all_rows)} original rows from {args.input}")
+
+    with open(args.batch_output) as f:
+        batch_results = [json.loads(line) for line in f]
+    print(f"Loaded {len(batch_results)} batch results from {args.batch_output}")
+
+    n_included = 0
+    n_excluded = 0
+    n_errors = 0
+    n_atoms_before = 0
+    n_atoms_after = 0
+
+    inc_f = open(args.out_included, 'w')
+    exc_f = open(args.out_excluded, 'w')
+
+    try:
+        for br in batch_results:
+            cid = br['custom_id']
+            # custom_id is "filter-{position_number}"
+            pos_num = int(cid.split('-', 1)[1])
+            row = all_rows.get(pos_num)
+            if row is None:
+                print(f"  WARNING: no row for {cid}, skipping")
+                continue
+
+            resp = br.get('response', {})
+            if resp.get('status_code') != 200:
+                print(f"  ERROR: {cid} status={resp.get('status_code')}")
+                n_errors += 1
+                continue
+
+            text = resp['body']['choices'][0]['message']['content']
+            result = parse_json_output(text)
+
+            if 'atoms' not in result:
+                # Keep as-is on parse failure
+                out_row = dict(row)
+                out_row['filter_error'] = 'no atoms key in response'
+                inc_f.write(json.dumps(out_row) + '\n')
+                n_included += 1
+                continue
+
+            filter_info, out_row = apply_filter_result(row, result)
+            out_row['filter_result'] = filter_info.get('atoms', [])
+
+            old_n = len(row['extracted'].get('reasoning', []))
+            new_n = len(filter_info['filtered_reasoning'])
+            n_atoms_before += old_n
+            n_atoms_after += new_n
+
+            if not filter_info['filtered_reasoning']:
+                out_row['exclude_reason'] = 'no reasoning atoms after filter'
+                exc_f.write(json.dumps(out_row) + '\n')
+                n_excluded += 1
+            else:
+                inc_f.write(json.dumps(out_row) + '\n')
+                n_included += 1
+
+        # Also write rows that had no reasoning (skipped in batch)
+        processed_nums = set()
+        for br in batch_results:
+            pos_num = int(br['custom_id'].split('-', 1)[1])
+            processed_nums.add(pos_num)
+        for pos_num, row in all_rows.items():
+            if pos_num not in processed_nums:
+                reasoning = row['extracted'].get('reasoning', [])
+                if not reasoning:
+                    row_copy = dict(row)
+                    row_copy['exclude_reason'] = 'no reasoning atoms'
+                    exc_f.write(json.dumps(row_copy) + '\n')
+                    n_excluded += 1
+                else:
+                    inc_f.write(json.dumps(row) + '\n')
+                    n_included += 1
+
+    finally:
+        inc_f.close()
+        exc_f.close()
+
+    print(f"\nDone. {n_included} included, {n_excluded} excluded, {n_errors} errors.")
+    print(f"Atoms: {n_atoms_before} -> {n_atoms_after} "
+          f"({n_atoms_before - n_atoms_after} net removed)")
+    print(f"  Included -> {args.out_included}")
+    print(f"  Excluded -> {args.out_excluded}")
+
+
 def cmd_filter(args):
-    """Filter extracted atoms: keep/contextualize/move_to_alternative/remove."""
+    """Filter extracted atoms synchronously (no batch). Useful for small runs."""
     import openai
     client = openai.OpenAI()
 
@@ -1127,7 +1261,7 @@ def cmd_filter(args):
         board = chess.Board(row['fen'])
         san = board.san(chess.Move.from_uci(row['move_uci']))
 
-        result, out_row = run_filter(row, client, model=args.model)
+        result, out_row = filter_atoms(row, client, model=args.model)
 
         old_reasoning = row['extracted'].get('reasoning', [])
         new_reasoning = result['filtered_reasoning']
@@ -1237,9 +1371,28 @@ def main():
     p_sync.add_argument('--depth', type=int, default=22)
     p_sync.add_argument('--verify', action='store_true')
 
-    # -- filter --
+    # -- filter-prepare --
+    p_fp = sub.add_parser('filter-prepare',
+        help='Build batch request JSONL for filter pass')
+    p_fp.add_argument('--input', required=True,
+                      help='Input JSONL (included.jsonl)')
+    p_fp.add_argument('--batch-file', required=True,
+                      help='Output batch request JSONL')
+    p_fp.add_argument('--model', default=DEFAULT_MODEL)
+
+    # -- filter-process --
+    p_fproc = sub.add_parser('filter-process',
+        help='Join filter batch output with original rows')
+    p_fproc.add_argument('--input', required=True,
+                         help='Original input JSONL (same as filter-prepare --input)')
+    p_fproc.add_argument('--batch-output', required=True,
+                         help='Batch output JSONL from collect step')
+    p_fproc.add_argument('--out-included', required=True)
+    p_fproc.add_argument('--out-excluded', required=True)
+
+    # -- filter (sync) --
     p_filt = sub.add_parser('filter',
-        help='Filter extracted atoms: keep/contextualize/move_to_alternative/remove')
+        help='Filter extracted atoms synchronously (no batch)')
     p_filt.add_argument('--input', required=True,
                         help='Input JSONL (included.jsonl from process step)')
     p_filt.add_argument('--out-included', required=True,
@@ -1261,6 +1414,10 @@ def main():
         cmd_process(args)
     elif args.command == 'sync':
         cmd_sync(args)
+    elif args.command == 'filter-prepare':
+        cmd_filter_prepare(args)
+    elif args.command == 'filter-process':
+        cmd_filter_process(args)
     elif args.command == 'filter':
         cmd_filter(args)
 

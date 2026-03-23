@@ -62,7 +62,25 @@ python evaluation/extract_all.py process \
 `sync` subcommand available for small runs without the batch API.
 
 ```bash
-# 5. Filter atoms: contextualize, move to alternative, deduplicate
+# 5a. Filter atoms via Batch API (recommended — 50% off)
+python evaluation/extract_all.py filter-prepare \
+    --input evaluation/data/logical_chess_atomize/included.jsonl \
+    --batch-file evaluation/data/logical_chess_atomize/filter_batch_input.jsonl
+
+python evaluation/extract_all.py submit \
+    --batch-file evaluation/data/logical_chess_atomize/filter_batch_input.jsonl
+
+python evaluation/extract_all.py collect \
+    --batch-id <BATCH_ID> \
+    --output evaluation/data/logical_chess_atomize/filter_batch_output.jsonl --poll
+
+python evaluation/extract_all.py filter-process \
+    --input evaluation/data/logical_chess_atomize/included.jsonl \
+    --batch-output evaluation/data/logical_chess_atomize/filter_batch_output.jsonl \
+    --out-included evaluation/data/logical_chess_atomize/included_filtered.jsonl \
+    --out-excluded evaluation/data/logical_chess_atomize/excluded_filtered.jsonl
+
+# 5b. Or filter synchronously (no batch, direct API)
 python evaluation/extract_all.py filter \
     --input evaluation/data/logical_chess_atomize/included.jsonl \
     --out-included evaluation/data/logical_chess_atomize/included_filtered.jsonl \

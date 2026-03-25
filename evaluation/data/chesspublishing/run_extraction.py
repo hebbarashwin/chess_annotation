@@ -65,6 +65,13 @@ For VARIATION entries (sidelines), you will also receive:
   an alternative)
 - parent_comment: framing context from the annotator on the parent move
 
+For MAINLINE entries with sidelines, you will also receive:
+- alternatives: structured list of alternative moves from the PGN, each
+  with move_san, annotation (the annotator's comment), and line
+  (continuation moves). Use these to populate the "alternative" field
+  in your output — extract reasoning atoms from the annotator's comments
+  on each alternative.
+
 Your job is to EXTRACT and STRUCTURE the commentary into a JSON object.
 
 Output ONLY valid JSON. No preamble, no markdown fences, no explanation.
@@ -154,6 +161,13 @@ ATOM RULES:
 
 11. For sidelines: the alternative field captures the MAINLINE move that
     the annotator is comparing against, if they discuss it.
+
+12. For mainline entries with "alternatives" provided: use the annotator's
+    comments and lines from the alternatives to populate the "alternative"
+    field. Each alternative may have annotation text and a continuation
+    line — extract reasoning atoms from these just as you would from the
+    main commentary. If there are multiple alternatives, output
+    "alternative" as a list of objects.
 """
 
 # ── Few-shot demos ───────────────────────────────────────────────────────
@@ -264,7 +278,18 @@ def build_user_prompt(entry):
         prompt += f"Mainline move: {entry['mainline_move']} (this entry discusses {move_san} as an alternative)\n"
     if entry.get('parent_comment'):
         prompt += f"Parent context: \"{entry['parent_comment']}\"\n"
+    if entry.get('alternatives'):
+        prompt += "\nAlternative variations from the PGN:\n"
+        for alt in entry['alternatives']:
+            prompt += f"  - {alt['move_san']}"
+            if alt.get('annotation'):
+                prompt += f": {alt['annotation']}"
+            if alt.get('line'):
+                prompt += f" (line: {alt['line']})"
+            prompt += "\n"
     prompt += f'\nCommentary: \"{entry["annotation"]}\"\n'
+    if entry.get('line'):
+        prompt += f"Continuation line: {entry['line']}\n"
     return prompt
 
 
@@ -304,8 +329,10 @@ def postprocess_filter(parsed):
     if parsed.get('include', True) and not parsed.get('reasoning'):
         return False, "no reasoning atoms extracted"
     alt = parsed.get('alternative')
-    if alt and not alt.get('reasoning'):
-        return False, "alternative has no reasoning"
+    if alt:
+        alts = alt if isinstance(alt, list) else [alt]
+        if any(not a.get('reasoning') for a in alts):
+            return False, "alternative has no reasoning"
     return parsed.get('include', True), parsed.get('exclude_reason')
 
 

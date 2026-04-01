@@ -317,6 +317,160 @@ def tool_compare_positions(fen_a, fen_b, depth=18):
     })
 
 
+def tool_check_threat(fen, threat_move, max_defenses=5):
+    """
+    Check if a move is a genuine threat in the given position.
+
+    A threat is a move that the side NOT currently to move wants to play on their
+    NEXT turn (after the opponent moves). This function:
+    1. Generates all legal moves for the side to move (opponent of threatening side)
+    2. For each opponent move, checks if threat_move becomes legal and effective
+    3. Returns whether the threat works and what defenses exist
+
+    Args:
+        fen: Position where opponent is to move
+        threat_move: The threatened move (SAN or UCI) by the side NOT to move
+        max_defenses: Maximum number of defensive moves to report
+
+    Returns JSON with:
+        - threat_viable: Can threat be played after opponent moves?
+        - n_positions_checked: How many opponent moves were tried
+        - n_threat_works: In how many positions does threat achieve its goal?
+        - n_threat_fails: In how many positions does threat fail?
+        - defenses: List of moves that defend against the threat
+        - sample_success: Example continuation where threat works
+        - threat_type: What the threat accomplishes (mate/material/positional)
+    """
+    board = chess.Board(fen)
+    opponent_moves = list(board.legal_moves)
+
+    if not opponent_moves:
+        return _json.dumps({"error": "No legal moves for opponent (position is checkmate or stalemate)"})
+
+    # Threatening side is opposite of current turn
+    threatening_side = not board.turn
+
+    threat_works_count = 0
+    threat_fails_count = 0
+    defenses = []
+    sample_success = None
+    threat_type = None
+
+    for opp_move in opponent_moves:
+        # Play opponent's move
+        board_after = board.copy()
+        board_after.push(opp_move)
+
+        # Try to parse and play the threat move
+        try:
+            # Try SAN first, then UCI
+            threat = None
+            try:
+                threat = board_after.parse_san(threat_move)
+            except:
+                try:
+                    threat = chess.Move.from_uci(threat_move)
+                except:
+                    pass
+
+            if threat is None:
+                # Could not parse the threat move
+                threat_fails_count += 1
+                if len(defenses) < max_defenses:
+                    defenses.append({
+                        'move': board.san(opp_move),
+                        'reason': f'Could not parse threat move: {threat_move}'
+                    })
+                continue
+
+            if threat not in board_after.legal_moves:
+                # Threat is not legal in this position
+                threat_fails_count += 1
+                defenses.append({
+                    'move': board.san(opp_move),
+                    'reason': f'Makes {threat_move} illegal'
+                })
+                continue
+
+            # Play the threat move
+            board_after.push(threat)
+
+            # Evaluate what the threat accomplishes
+            is_checkmate = board_after.is_checkmate()
+            is_check = board_after.is_check()
+
+            # Use engine to evaluate if needed
+            threat_accomplishment = None
+            if is_checkmate:
+                threat_accomplishment = "checkmate"
+                threat_works_count += 1
+                if not threat_type:
+                    threat_type = "mate"
+                if not sample_success:
+                    sample_success = f"{board.san(opp_move)} {board_after.san(threat)}"
+            else:
+                # Evaluate the position
+                with chess.engine.SimpleEngine.popen_uci(STOCKFISH_PATH) as engine:
+                    info = engine.analyse(board_after, chess.engine.Limit(depth=18))
+                    score = info.get("score")
+
+                    if score and score.relative:
+                        # Convert to centipawns from threatening side's perspective
+                        cp = score.relative.score(mate_score=10000)
+                        if threatening_side == chess.BLACK:
+                            cp = -cp
+
+                        # Check if threat wins material or gives strong advantage
+                        if cp is not None:
+                            if cp > 300:  # Winning advantage
+                                threat_accomplishment = f"wins material/position (+{cp/100:.2f})"
+                                threat_works_count += 1
+                                if not threat_type:
+                                    threat_type = "material" if cp > 200 else "positional"
+                                if not sample_success:
+                                    sample_success = f"{board.san(opp_move)} {board_after.san(threat)}"
+                            elif cp > 100:  # Strong advantage
+                                threat_accomplishment = f"strong advantage (+{cp/100:.2f})"
+                                threat_works_count += 1
+                                if not threat_type:
+                                    threat_type = "positional"
+                                if not sample_success:
+                                    sample_success = f"{board.san(opp_move)} {board_after.san(threat)}"
+                            else:
+                                # Threat doesn't accomplish much
+                                threat_fails_count += 1
+                                if len(defenses) < max_defenses:
+                                    defenses.append({
+                                        'move': board.san(opp_move),
+                                        'reason': f'Threat gives only +{cp/100:.2f}'
+                                    })
+
+        except Exception as e:
+            # Threat move invalid or error in evaluation
+            threat_fails_count += 1
+            if len(defenses) < max_defenses:
+                defenses.append({
+                    'move': board.san(opp_move),
+                    'reason': f'Error: {str(e)[:50]}'
+                })
+
+    # Determine if threat is viable
+    threat_viable = threat_works_count > 0
+    threat_percentage = (threat_works_count / len(opponent_moves) * 100) if opponent_moves else 0
+
+    return _json.dumps({
+        "threat_viable": threat_viable,
+        "n_positions_checked": len(opponent_moves),
+        "n_threat_works": threat_works_count,
+        "n_threat_fails": threat_fails_count,
+        "threat_percentage": f"{threat_percentage:.1f}%",
+        "defenses": defenses[:max_defenses],
+        "sample_success": sample_success,
+        "threat_type": threat_type,
+        "summary": f"Threat {'works' if threat_viable else 'fails'}: accomplishes goal in {threat_works_count}/{len(opponent_moves)} positions"
+    })
+
+
 TOOL_FUNCTIONS = {
     "get_legal_moves": tool_get_legal_moves, "get_piece_at": tool_get_piece_at,
     "get_attacks": tool_get_attacks, "get_attackers": tool_get_attackers,
@@ -328,6 +482,7 @@ TOOL_FUNCTIONS = {
     "compare_moves": tool_compare_moves, "make_move": tool_make_move,
     "get_squares": tool_get_squares, "get_material": tool_get_material,
     "compare_positions": tool_compare_positions,
+    "check_threat": tool_check_threat,
 }
 
 def _schema(name, desc, props, required):
@@ -372,6 +527,11 @@ TOOL_SCHEMAS_OPENAI = [
             {**_fen_prop, "piece": {"type": "string", "enum": ["pawn","knight","bishop","rook","queen","king"]},
              "color": {"type": "string", "enum": ["white", "black"]}}, ["fen", "piece"]),
     _schema("get_material", "Get material count for both sides.", _fen_prop, ["fen"]),
+    _schema("check_threat", "Check if a move is a genuine threat. Use this to verify claims like 'threatens Qg7 mate' or 'threatens to win the bishop'. The threat is a move the side NOT to move wants to play on their next turn.",
+            {**_fen_prop,
+             "threat_move": {"type": "string", "description": "The threatened move in SAN (e.g., 'Qg7') or UCI"},
+             "max_defenses": {"type": "integer", "description": "Max number of defensive moves to report (default 5)"}},
+            ["fen", "threat_move"]),
 ]
 
 TOOL_SCHEMAS_ANTHROPIC = [

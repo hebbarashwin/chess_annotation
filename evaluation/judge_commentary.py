@@ -25,7 +25,9 @@ Usage:
 
 import argparse
 import json
+import os
 import re
+import subprocess
 import sys
 import chess
 
@@ -160,6 +162,30 @@ def judge_file(input_path, output_path, commentary_field='generated_commentary',
                 print(f"    Alternatives: {len(results['alternatives'])}")
 
     print(f"\n✓ Wrote {len(entries)} results to {output_path}")
+
+    # Run analysis and save to file
+    output_dir = os.path.dirname(output_path) or '.'
+    output_basename = os.path.basename(output_path)
+    output_name = os.path.splitext(output_basename)[0]
+    analysis_path = os.path.join(output_dir, f"analysis_{output_name}.txt")
+
+    print(f"\nRunning analysis...")
+    try:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        analyze_script = os.path.join(script_dir, 'analyze_judge_results.py')
+
+        with open(analysis_path, 'w') as f:
+            subprocess.run(
+                ['python3', analyze_script, output_path],
+                stdout=f,
+                stderr=subprocess.PIPE,
+                check=True
+            )
+        print(f"✓ Analysis saved to {analysis_path}")
+    except subprocess.CalledProcessError as e:
+        print(f"⚠ Analysis failed: {e.stderr.decode()}")
+    except Exception as e:
+        print(f"⚠ Analysis failed: {e}")
 
 
 def main():

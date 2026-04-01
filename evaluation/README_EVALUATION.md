@@ -90,6 +90,7 @@ python batch_evaluate.py --input positions.jsonl --output results.jsonl --n 10
 - **`generate_commentary.py`**: Generate commentary for positions
 - **`judge_commentary.py`**: Judge existing commentary
 - **`batch_evaluate.py`**: Full generate + judge pipeline
+- **`analyze_judge_results.py`**: Analyze judged results (aggregate metrics, breakdowns)
 
 ## Installation
 
@@ -153,6 +154,25 @@ python batch_evaluate.py --input positions.jsonl --output results.jsonl --indice
 # Use different models for generation vs judging
 python batch_evaluate.py --input positions.jsonl --output results.jsonl \
     --gen-model gpt-4o --model claude-sonnet-4-5-20250929 --n 20
+```
+
+### 4. Analyze Results
+
+```bash
+# Analyze single file
+python analyze_judge_results.py outputs_judge/judged_gpt4o_1.jsonl
+
+# Save report to file
+python analyze_judge_results.py outputs_judge/judged_gpt4o_1.jsonl > report.txt
+
+# Compare multiple files
+python analyze_judge_results.py --compare outputs_judge/*.jsonl
+
+# Break down by quality level
+python analyze_judge_results.py --by-quality outputs_judge/judged_gpt4o_1.jsonl
+
+# Break down by wp_loss bins
+python analyze_judge_results.py --by-wp-loss outputs_judge/judged_gpt4o_1.jsonl
 ```
 
 ## Data Format

@@ -86,7 +86,7 @@ def tool_check_ray_alignment(square_a, square_b):
     if chess.square_file(sq_a) == chess.square_file(sq_b):
         result["aligned"] = True
         result["ray_type"] = "file"
-        result["file"] = chess.file_name(chess.square_file(sq_a))
+        result["file"] = chr(ord('a') + chess.square_file(sq_a))
         return _json.dumps(result)
     
     if abs(chess.square_file(sq_a) - chess.square_file(sq_b)) == \

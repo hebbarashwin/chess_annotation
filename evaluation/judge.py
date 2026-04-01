@@ -336,7 +336,9 @@ def _parse_judge_json(text: str) -> dict:
 
 
 def decompose_to_atoms(text: str, provider: str = "openai",
-                      model: str = "gpt-4o") -> Tuple[List[str], List[dict]]:
+                      model: str = "gpt-4o",
+                      base_url: Optional[str] = None,
+                      api_key: Optional[str] = None) -> Tuple[List[str], List[dict]]:
     """
     Decompose NL explanation into claims and atoms.
 
@@ -348,6 +350,8 @@ def decompose_to_atoms(text: str, provider: str = "openai",
         text: Explanation text to decompose
         provider: LLM provider ('openai', 'anthropic', or 'qwen')
         model: Model name
+        base_url: Base URL for OpenAI-compatible APIs
+        api_key: API key (optional)
 
     Returns:
         Tuple of (atoms_list, claims_list)
@@ -360,7 +364,8 @@ def decompose_to_atoms(text: str, provider: str = "openai",
         {"role": "system", "content": DECOMPOSE_SYSTEM},
         {"role": "user", "content": text},
     ]
-    resp, _ = call_llm(messages, provider=provider, model=model, temperature=0.0)
+    resp, _ = call_llm(messages, provider=provider, model=model, temperature=0.0,
+                       base_url=base_url, api_key=api_key)
     data = _parse_judge_json(resp.text)
 
     # Flatten atoms and build claims structure
@@ -458,7 +463,9 @@ def classify_atom(atom_text: str) -> List[str]:
 
 def verify_single_atom(atom: str, fen: str, move_san: str, move_uci: str,
                       provider: str = "openai", model: str = "gpt-4o",
-                      verbose: bool = True) -> dict:
+                      verbose: bool = True,
+                      base_url: Optional[str] = None,
+                      api_key: Optional[str] = None) -> dict:
     """
     Verify a single atom with a fresh tool-calling conversation.
 
@@ -476,6 +483,8 @@ def verify_single_atom(atom: str, fen: str, move_san: str, move_uci: str,
         provider: LLM provider ('openai', 'anthropic', or 'qwen')
         model: Model name
         verbose: Print progress
+        base_url: Base URL for OpenAI-compatible APIs
+        api_key: API key (optional)
 
     Returns:
         Dict with:
@@ -518,7 +527,8 @@ def verify_single_atom(atom: str, fen: str, move_san: str, move_uci: str,
 
     text, tool_log = call_with_tools(
         messages, provider=provider, model=model,
-        temperature=0.0, max_rounds=10, verbose=verbose)
+        temperature=0.0, max_rounds=10, verbose=verbose,
+        base_url=base_url, api_key=api_key)
 
     data = _parse_judge_json(text)
 
@@ -668,7 +678,9 @@ def run_sanity_checks(verify_result: dict, fen: str, move_uci: str,
 def verify_atoms_improved(atoms: List[str], fen: str, move_san: str,
                          move_uci: str, alternatives: Optional[List[dict]] = None,
                          provider: str = "openai", model: str = "gpt-4o",
-                         verbose: bool = True) -> Tuple[List[dict], str, List[dict]]:
+                         verbose: bool = True,
+                         base_url: Optional[str] = None,
+                         api_key: Optional[str] = None) -> Tuple[List[dict], str, List[dict]]:
     """
     Per-atom verification with sanity checks.
 
@@ -688,6 +700,8 @@ def verify_atoms_improved(atoms: List[str], fen: str, move_san: str,
         provider: LLM provider ('openai', 'anthropic', or 'qwen')
         model: Model name
         verbose: Print progress
+        base_url: Base URL for OpenAI-compatible APIs
+        api_key: API key (optional)
 
     Returns:
         Tuple of (results_list, assessment, all_tool_logs)
@@ -713,7 +727,8 @@ def verify_atoms_improved(atoms: List[str], fen: str, move_san: str,
 
         v_result = verify_single_atom(
             atom, fen, move_san, move_uci,
-            provider=provider, model=model, verbose=verbose)
+            provider=provider, model=model, verbose=verbose,
+            base_url=base_url, api_key=api_key)
 
         # Check if this atom is about an alternative (skip comparison check)
         is_alt_atom = i in alt_atom_indices
@@ -760,7 +775,9 @@ def verify_atoms_improved(atoms: List[str], fen: str, move_san: str,
 # ============================================================================
 
 def match_gold_atoms(candidate_atoms: List[str], gold_atoms: List[str],
-                    provider: str = "openai", model: str = "gpt-4o") -> List[dict]:
+                    provider: str = "openai", model: str = "gpt-4o",
+                    base_url: Optional[str] = None,
+                    api_key: Optional[str] = None) -> List[dict]:
     """
     Check which gold atoms are covered by candidate atoms.
 
@@ -772,6 +789,8 @@ def match_gold_atoms(candidate_atoms: List[str], gold_atoms: List[str],
         gold_atoms: List of gold standard atomic claims
         provider: LLM provider ('openai', 'anthropic', or 'qwen')
         model: Model name
+        base_url: Base URL for OpenAI-compatible APIs
+        api_key: API key (optional)
 
     Returns:
         List of matching results, one per gold atom:
@@ -791,7 +810,8 @@ def match_gold_atoms(candidate_atoms: List[str], gold_atoms: List[str],
         {"role": "system", "content": MATCH_SYSTEM},
         {"role": "user", "content": user_msg},
     ]
-    resp, _ = call_llm(messages, provider=provider, model=model, temperature=0.0)
+    resp, _ = call_llm(messages, provider=provider, model=model, temperature=0.0,
+                       base_url=base_url, api_key=api_key)
     data = _parse_judge_json(resp.text)
     return data.get('results', [])
 
@@ -874,7 +894,9 @@ def check_quality_improved(atoms_results: List[dict], fen: str,
 
 def extract_alternatives(explanation: str, atoms: List[str], fen: str,
                         move_san: str, provider: str = "openai",
-                        model: str = "gpt-4o") -> List[dict]:
+                        model: str = "gpt-4o",
+                        base_url: Optional[str] = None,
+                        api_key: Optional[str] = None) -> List[dict]:
     """
     Extract alternative moves mentioned in the explanation.
 
@@ -893,6 +915,8 @@ def extract_alternatives(explanation: str, atoms: List[str], fen: str,
         move_san: Played move in SAN
         provider: LLM provider ('openai', 'anthropic', or 'qwen')
         model: Model name
+        base_url: Base URL for OpenAI-compatible APIs
+        api_key: API key (optional)
 
     Returns:
         List of dicts with:
@@ -915,7 +939,8 @@ def extract_alternatives(explanation: str, atoms: List[str], fen: str,
         {"role": "user", "content": user_msg},
     ]
 
-    resp, _ = call_llm(messages, provider=provider, model=model, temperature=0.0)
+    resp, _ = call_llm(messages, provider=provider, model=model, temperature=0.0,
+                       base_url=base_url, api_key=api_key)
     data = _parse_judge_json(resp.text)
     alternatives_list = data.get('alternatives', [])
 
@@ -944,7 +969,9 @@ def extract_alternatives(explanation: str, atoms: List[str], fen: str,
 def verify_alternative_atoms(alternative: dict, atoms: List[str], fen: str,
                             move_san: str, verification_results: List[dict],
                             provider: str = "openai", model: str = "gpt-4o",
-                            verbose: bool = True):
+                            verbose: bool = True,
+                            base_url: Optional[str] = None,
+                            api_key: Optional[str] = None):
     """
     Verify atoms that discuss an alternative move in that alternative's context.
 
@@ -961,6 +988,8 @@ def verify_alternative_atoms(alternative: dict, atoms: List[str], fen: str,
         provider: LLM provider ('openai', 'anthropic', or 'qwen')
         model: Model name
         verbose: Print progress
+        base_url: Base URL for OpenAI-compatible APIs
+        api_key: API key (optional)
     """
     if not alternative.get('atom_indices'):
         return
@@ -988,7 +1017,8 @@ def verify_alternative_atoms(alternative: dict, atoms: List[str], fen: str,
         # Verify in alternative context
         v_result = verify_single_atom(
             atom, fen, alt_move_san, alternative['move_uci'],
-            provider=provider, model=model, verbose=False)
+            provider=provider, model=model, verbose=False,
+            base_url=base_url, api_key=api_key)
 
         sanity = run_sanity_checks(v_result, fen, alternative['move_uci'])
 
@@ -1019,7 +1049,9 @@ def judge_explanation_improved(entry: dict, explanation: str,
                               gold_atoms: Optional[List[str]] = None,
                               provider: str = "openai", model: str = "gpt-4o",
                               verbose: bool = True,
-                              reverify_alts: bool = False) -> dict:
+                              reverify_alts: bool = False,
+                              base_url: Optional[str] = None,
+                              api_key: Optional[str] = None) -> dict:
     """
     Improved judge pipeline: decompose -> per-atom verify + sanity -> match gold -> quality -> scoring.
 
@@ -1042,6 +1074,8 @@ def judge_explanation_improved(entry: dict, explanation: str,
         model: Model name
         verbose: Print progress
         reverify_alts: Re-verify alternative-move atoms in alternative context
+        base_url: Base URL for OpenAI-compatible APIs (for Qwen)
+        api_key: API key (optional)
 
     Returns:
         Enriched dict with all dimensions:
@@ -1066,7 +1100,8 @@ def judge_explanation_improved(entry: dict, explanation: str,
     # 1. Decompose into claims and atoms
     if verbose:
         print("  Decomposing into claims and atoms...")
-    atoms, claims = decompose_to_atoms(explanation, provider=provider, model=model)
+    atoms, claims = decompose_to_atoms(explanation, provider=provider, model=model,
+                                       base_url=base_url, api_key=api_key)
     if verbose:
         print(f"  -> {len(claims)} claims, {len(atoms)} atoms")
 
@@ -1075,7 +1110,8 @@ def judge_explanation_improved(entry: dict, explanation: str,
         print("  Extracting alternative moves...")
     alternatives = extract_alternatives(
         explanation, atoms, entry['fen'], move_san,
-        provider=provider, model=model)
+        provider=provider, model=model,
+        base_url=base_url, api_key=api_key)
     if verbose:
         if alternatives:
             print(f"  -> {len(alternatives)} alternative(s) found:")
@@ -1093,7 +1129,8 @@ def judge_explanation_improved(entry: dict, explanation: str,
     verification, gen_assessment, verify_log = verify_atoms_improved(
         atoms, entry['fen'], move_san, entry['move_uci'],
         alternatives=alternatives,
-        provider=provider, model=model, verbose=verbose)
+        provider=provider, model=model, verbose=verbose,
+        base_url=base_url, api_key=api_key)
 
     n_verified = sum(1 for r in verification if r.get('verified'))
     n_overridden = sum(1 for r in verification if r.get('was_overridden'))
@@ -1106,7 +1143,8 @@ def judge_explanation_improved(entry: dict, explanation: str,
         for alt in alternatives:
             verify_alternative_atoms(
                 alt, atoms, entry['fen'], move_san, verification,
-                provider=provider, model=model, verbose=verbose)
+                provider=provider, model=model, verbose=verbose,
+                base_url=base_url, api_key=api_key)
 
         # Recount after alternative verification
         n_verified_final = sum(1 for r in verification if r.get('verified'))
@@ -1143,7 +1181,8 @@ def judge_explanation_improved(entry: dict, explanation: str,
         gold_atoms = entry.get('extracted', {}).get('reasoning', [])
     if verbose:
         print(f"  Matching against {len(gold_atoms)} gold atoms...")
-    matching = match_gold_atoms(atoms, gold_atoms, provider=provider, model=model)
+    matching = match_gold_atoms(atoms, gold_atoms, provider=provider, model=model,
+                                base_url=base_url, api_key=api_key)
     n_covered = sum(1 for r in matching if r.get('covered'))
     if verbose:
         print(f"  -> {n_covered}/{len(gold_atoms)} covered")
@@ -1159,9 +1198,11 @@ def judge_explanation_improved(entry: dict, explanation: str,
     # 8. Scoring
     if verbose:
         print("  Scoring fluency & specificity...")
-    fluency = score_fluency(explanation, provider=provider, model=model)
+    fluency = score_fluency(explanation, provider=provider, model=model,
+                           base_url=base_url, api_key=api_key)
     specificity = score_specificity(explanation, entry['fen'], move_san,
-                                     provider=provider, model=model)
+                                     provider=provider, model=model,
+                                     base_url=base_url, api_key=api_key)
     if verbose:
         print(f"  -> fluency={fluency:.2f}, specificity={specificity:.2f}")
 

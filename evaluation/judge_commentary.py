@@ -8,6 +8,7 @@ Evaluates generated commentary using the full improved pipeline with:
 - Sanity checks
 - Gold atom matching
 - Multi-dimensional scoring
+- Automatic filtering of <think> tags (used by Qwen models)
 
 Usage:
     # Judge commentary in a file with generated text
@@ -24,10 +25,31 @@ Usage:
 
 import argparse
 import json
+import re
 import sys
 import chess
 
 from judge import judge_explanation_improved
+
+
+def remove_think_tags(text):
+    """
+    Remove <think>...</think> tags from text.
+
+    Used for Qwen models that output reasoning/thinking content wrapped in
+    <think> tags that should be excluded from the actual commentary.
+
+    Args:
+        text: Input text potentially containing <think> tags
+
+    Returns:
+        Text with all <think>...</think> blocks removed
+    """
+    # Remove <think>...</think> blocks (case-insensitive, handles multiline)
+    cleaned = re.sub(r'<think>.*?</think>', '', text, flags=re.IGNORECASE | re.DOTALL)
+    # Clean up any extra whitespace left behind
+    cleaned = re.sub(r'\n\s*\n', '\n', cleaned).strip()
+    return cleaned
 
 
 def judge_file(input_path, output_path, commentary_field='generated_commentary',
@@ -64,6 +86,13 @@ def judge_file(input_path, output_path, commentary_field='generated_commentary',
             if not commentary:
                 print(f"  WARNING: No commentary found in field '{commentary_field}', skipping")
                 continue
+
+            # Filter out <think> tags (used by Qwen models)
+            original_commentary = commentary
+            commentary = remove_think_tags(commentary)
+            if commentary != original_commentary:
+                if verbose:
+                    print(f"  Filtered <think> tags from commentary")
 
             # Build entry for judging
             board = chess.Board(entry_data['fen'])
@@ -106,6 +135,8 @@ def judge_file(input_path, output_path, commentary_field='generated_commentary',
                     'n_sanity_overrides': results['n_sanity_overrides'],
                     'n_alternatives': len(results.get('alternatives', [])),
                 },
+                'think_tags_filtered': commentary != original_commentary,
+                'filtered_commentary': commentary if commentary != original_commentary else None,
                 'atoms': results['atoms'],
                 'claims': results['claims'],
                 'verification': results['verification'],

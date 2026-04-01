@@ -10,6 +10,7 @@ Usage:
 
 import argparse
 import json
+import re
 import random
 import sys
 import numpy as np
@@ -17,6 +18,26 @@ import chess
 
 from generation import generate_commentary, generate_commentary_raw
 from judge import judge_explanation_improved
+
+
+def remove_think_tags(text):
+    """
+    Remove <think>...</think> tags from text.
+
+    Used for Qwen models that output reasoning/thinking content wrapped in
+    <think> tags that should be excluded from the actual commentary.
+
+    Args:
+        text: Input text potentially containing <think> tags
+
+    Returns:
+        Text with all <think>...</think> blocks removed
+    """
+    # Remove <think>...</think> blocks (case-insensitive, handles multiline)
+    cleaned = re.sub(r'<think>.*?</think>', '', text, flags=re.IGNORECASE | re.DOTALL)
+    # Clean up any extra whitespace left behind
+    cleaned = re.sub(r'\n\s*\n', '\n', cleaned).strip()
+    return cleaned
 
 
 def batch_evaluate(accepted_positions, indices=None, n=10, seed=42,
@@ -84,10 +105,16 @@ def batch_evaluate(accepted_positions, indices=None, n=10, seed=42,
                                                         base_url=base_url, api_key=api_key)
         print(f"  Generated: {gen_text[:100]}...")
 
+        # Filter out <think> tags (used by Qwen models)
+        original_gen_text = gen_text
+        gen_text_for_judging = remove_think_tags(gen_text)
+        if gen_text_for_judging != original_gen_text:
+            print(f"  Filtered <think> tags from generated text")
+
         print(f"  Judging ({provider}/{model}, improved)...")
         gold_atoms = pos['extracted'].get('reasoning', [])
         judge_results = judge_explanation_improved(
-            entry, gen_text, gold_atoms=gold_atoms,
+            entry, gen_text_for_judging, gold_atoms=gold_atoms,
             provider=provider, model=model, base_url=base_url, api_key=api_key)
 
         result_row = {
@@ -97,7 +124,9 @@ def batch_evaluate(accepted_positions, indices=None, n=10, seed=42,
             'game': pos.get('game', '?'),
             'wp_loss': pos.get('wp_loss', 0),
             'quality': pos.get('quality', '?'),
-            'generated_text': gen_text,
+            'generated_text': gen_text,  # Original with <think> tags if present
+            'think_tags_filtered': gen_text_for_judging != original_gen_text,
+            'filtered_text': gen_text_for_judging if gen_text_for_judging != original_gen_text else None,
             'gen_tool_calls': len(gen_log),
             'claim_accuracy': judge_results['claim_accuracy'],
             'n_claims': judge_results['n_claims'],

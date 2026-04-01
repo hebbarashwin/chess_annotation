@@ -12,6 +12,12 @@ Usage:
     # Generate with tools only (no engine)
     python generate_commentary.py --input positions.jsonl --output commentary.jsonl
 
+    # Resume after interruption (automatically detects where to start)
+    python generate_commentary.py --input positions.jsonl --output commentary.jsonl --resume
+
+    # Start from specific position index
+    python generate_commentary.py --input positions.jsonl --output commentary.jsonl --start-from 31
+
     # Use Qwen model hosted locally
     python generate_commentary.py --input positions.jsonl --provider qwen \
         --model Qwen/Qwen3-32B --base-url http://localhost:8000/v1
@@ -23,6 +29,7 @@ Usage:
 
 import argparse
 import json
+import os
 import sys
 import chess
 
@@ -32,7 +39,7 @@ from eval_utils import get_engine_analysis
 
 def generate_for_positions(input_path, output_path, provider="openai", model="gpt-4o",
                           use_engine=False, use_tools=True, ascii=False,
-                          base_url=None, api_key=None):
+                          base_url=None, api_key=None, start_from=0, resume=False):
     """
     Generate commentary for positions in a JSONL file.
 
@@ -46,6 +53,8 @@ def generate_for_positions(input_path, output_path, provider="openai", model="gp
         ascii: Include ASCII board in prompts
         base_url: Base URL for OpenAI-compatible APIs (for Qwen)
         api_key: API key (optional)
+        start_from: Index to start from (0-based)
+        resume: Automatically detect where to resume from existing output
     """
     with open(input_path) as f:
         positions = [json.loads(line) for line in f]
@@ -54,8 +63,36 @@ def generate_for_positions(input_path, output_path, provider="openai", model="gp
     print(f"Provider: {provider}, Model: {model}")
     print(f"Engine: {use_engine}, Tools: {use_tools}")
 
-    with open(output_path, 'w') as out_f:
+    # Handle resume mode: detect already-processed positions
+    if resume and os.path.exists(output_path):
+        with open(output_path) as f:
+            existing = [json.loads(line) for line in f]
+        existing_fens = {(e['fen'], e['move_uci']) for e in existing}
+
+        # Find first unprocessed position
         for i, pos in enumerate(positions):
+            if (pos['fen'], pos['move_uci']) not in existing_fens:
+                start_from = i
+                break
+        else:
+            # All positions already processed
+            start_from = len(positions)
+
+        print(f"Resume mode: Found {len(existing)} existing results, starting from position {start_from + 1}")
+    elif start_from > 0:
+        print(f"Starting from position {start_from + 1} (skipping first {start_from})")
+
+    # Skip already-processed positions
+    if start_from >= len(positions):
+        print(f"✓ All positions already processed!")
+        return
+
+    # Open in append mode if resuming, write mode otherwise
+    mode = 'a' if (resume or start_from > 0) and os.path.exists(output_path) else 'w'
+
+    with open(output_path, mode) as out_f:
+        for i in range(start_from, len(positions)):
+            pos = positions[i]
             print(f"\n[{i+1}/{len(positions)}] Processing position...")
 
             # Build entry
@@ -100,7 +137,8 @@ def generate_for_positions(input_path, output_path, provider="openai", model="gp
             out_f.write(json.dumps(result) + '\n')
             out_f.flush()
 
-    print(f"\n✓ Wrote {len(positions)} results to {output_path}")
+    n_processed = len(positions) - start_from
+    print(f"\n✓ Wrote {n_processed} results to {output_path}")
 
 
 def main():
@@ -118,6 +156,10 @@ def main():
                        help='Include ASCII board in prompts')
     parser.add_argument('--base-url', help='Base URL for OpenAI-compatible API (for Qwen)')
     parser.add_argument('--api-key', help='API key (optional)')
+    parser.add_argument('--start-from', type=int, default=0,
+                       help='Start from this position index (0-based)')
+    parser.add_argument('--resume', action='store_true',
+                       help='Resume from where output file left off (auto-detects position)')
 
     args = parser.parse_args()
 
@@ -131,6 +173,8 @@ def main():
         ascii=args.ascii,
         base_url=args.base_url,
         api_key=args.api_key,
+        start_from=args.start_from,
+        resume=args.resume,
     )
 
 
